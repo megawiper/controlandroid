@@ -34,8 +34,6 @@ jobs:
 
       - name: Sign APK (debug keystore)
         run: |
-          # Release APK by default unsigned hota hai, install nahi hoga.
-          # Isliye ek keystore bana ke sign kar rahe hain.
           keytool -genkeypair -v \
             -keystore release.keystore \
             -alias homemonitor \
@@ -53,12 +51,6 @@ jobs:
             --ks-pass pass:android \
             --key-pass pass:android \
             --out HomeMonitor.apk aligned.apk
-
-      - name: Upload APK as artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: HomeMonitor-APK
-          path: HomeMonitor.apk
 
       - name: Set release tag
         id: tag
@@ -79,4 +71,3 @@ jobs:
             Commit: ${{ github.sha }}
           files: HomeMonitor.apk
           prerelease: false
-
