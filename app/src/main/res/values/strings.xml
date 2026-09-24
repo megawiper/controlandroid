@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">System Service</string>
+
+    <!-- MainActivity buttons -->
+    <string name="btn_start_monitor">Start Monitor</string>
+    <string name="btn_stop_monitor">Stop Monitor</string>
+    <string name="status_running">● Monitor is RUNNING</string>
+    <string name="status_stopped">● Monitor is STOPPED</string>
+
+    <!-- Foreground notification -->
+    <string name="notif_channel_id">home_monitor_channel</string>
+    <string name="notif_channel_name">System Service</string>
+    <string name="notif_channel_desc">Persistent notification for the System Service</string>
+    <string name="notif_title">System Service</string>
+    <string name="notif_text">System service…</string>
+</resources>

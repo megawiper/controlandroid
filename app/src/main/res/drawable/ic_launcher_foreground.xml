@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    HomeMonitor launcher icon foreground — a simple house / monitor silhouette.
+    Designed for the 108dp adaptive-icon safe zone (foreground is 72dp centred).
+    White paths on the dark-blue background give a clean, readable icon.
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- House roof -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M54,22 L22,50 L30,50 L30,82 L50,82 L50,62 L58,62 L58,82 L78,82 L78,50 L86,50 Z" />
+
+    <!-- Chimney -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M62,22 L62,38 L70,38 L70,22 Z" />
+
+    <!-- Signal arc 1 (innermost) -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="3"
+        android:fillAlpha="0"
+        android:pathData="M38,90 Q54,82 70,90" />
+
+    <!-- Signal arc 2 -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="3"
+        android:fillAlpha="0"
+        android:pathData="M30,98 Q54,86 78,98" />
+
+</vector>
