@@ -10,6 +10,11 @@ on:
 permissions:
   contents: write
 
+env:
+  KEY_ALIAS: homemonitor
+  KEY_PASS: yash1234
+  KEYSTORE_B64: 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
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -32,14 +37,9 @@ jobs:
       - name: Build Release APK
         run: gradle assembleRelease --stacktrace
 
-      - name: Sign APK (debug keystore)
+      - name: Sign APK (permanent keystore)
         run: |
-          keytool -genkeypair -v \
-            -keystore release.keystore \
-            -alias homemonitor \
-            -keyalg RSA -keysize 2048 -validity 10000 \
-            -storepass android -keypass android \
-            -dname "CN=HomeMonitor, OU=Dev, O=Yash, L=IN, S=IN, C=IN"
+          echo "$KEYSTORE_B64" | base64 -d > release.keystore
 
           BT=$(ls $ANDROID_HOME/build-tools | sort -V | tail -n 1)
           UNSIGNED=$(ls app/build/outputs/apk/release/*.apk | head -n 1)
@@ -47,10 +47,12 @@ jobs:
           $ANDROID_HOME/build-tools/$BT/zipalign -v -p 4 "$UNSIGNED" aligned.apk
           $ANDROID_HOME/build-tools/$BT/apksigner sign \
             --ks release.keystore \
-            --ks-key-alias homemonitor \
-            --ks-pass pass:android \
-            --key-pass pass:android \
+            --ks-key-alias "$KEY_ALIAS" \
+            --ks-pass pass:"$KEY_PASS" \
+            --key-pass pass:"$KEY_PASS" \
             --out HomeMonitor.apk aligned.apk
+
+          $ANDROID_HOME/build-tools/$BT/apksigner verify --print-certs HomeMonitor.apk | head -3
 
       - name: Set release tag
         id: tag
