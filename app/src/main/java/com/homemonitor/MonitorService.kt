@@ -1281,12 +1281,12 @@ class MonitorService : LifecycleService() {
                         sb.append("<li><a href='/${f.name}'>📄 ${f.name}</a> <small style='color:#888'>${formatSize(f.length())}</small></li>")
                     }
                     sb.append("</ul></body></html>")
-                    return Response.newFixedLengthResponse(Status.OK, "text/html", sb.toString())
+                    return newFixedLengthResponse(Status.OK, "text/html", sb.toString())
                 }
 
                 // File download
                 val file = files.firstOrNull { it.name == uri }
-                    ?: return Response.newFixedLengthResponse(Status.NOT_FOUND, "text/plain", "File not found")
+                    ?: return newFixedLengthResponse(Status.NOT_FOUND, "text/plain", "File not found")
 
                 val mime = MimeTypeMap.getSingleton()
                     .getMimeTypeFromExtension(file.extension.lowercase())
@@ -1294,12 +1294,12 @@ class MonitorService : LifecycleService() {
 
                 return try {
                     val fis = FileInputStream(file)
-                    Response.newChunkedResponse(Status.OK, mime, fis).also {
+                    newChunkedResponse(Status.OK, mime, fis).also {
                         it.addHeader("Content-Disposition", "attachment; filename=\"${file.name}\"")
                         it.addHeader("Content-Length", file.length().toString())
                     }
                 } catch (e: Exception) {
-                    Response.newFixedLengthResponse(Status.INTERNAL_ERROR, "text/plain", "Error: ${e.message}")
+                    newFixedLengthResponse(Status.INTERNAL_ERROR, "text/plain", "Error: ${e.message}")
                 }
             }
         }
