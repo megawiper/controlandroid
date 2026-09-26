@@ -28,6 +28,9 @@
     <!-- Auto-start on device boot -->
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
 
+    <!-- Exempt from battery optimization — keeps polling responsive even in Battery Saver -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+
     <!-- Wake lock so the polling loop doesn't get killed during sleep -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />
 
