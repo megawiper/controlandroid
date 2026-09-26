@@ -62,6 +62,5 @@ dependencies {
     // Lifecycle Service (LifecycleService base class)
     implementation(libs.lifecycle.service)
 
-    // NanoHTTPD - embedded HTTP server for /sharelink Cloudflare tunnel feature
-    implementation(libs.nanohttpd)
+
 }
