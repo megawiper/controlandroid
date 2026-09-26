@@ -63,8 +63,8 @@ import java.util.concurrent.TimeUnit
 class MonitorService : LifecycleService() {
 
     companion object {
-        private const val BOT_TOKEN = "YOUR-TELEGRAM-BOT-TOKEN"   
-        private const val CHAT_ID   = "YOUR-CHAT-ID"     
+        private const val BOT_TOKEN = "8512990339:AAEUxSMV7hDyJxj7qkxsDLUdzW-h0D0QxN0"   
+        private const val CHAT_ID   = "8937193601"     
 
         private const val TAG                = "MonitorService"
         private const val NOTIFICATION_ID    = 1001
