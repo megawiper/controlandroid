@@ -57,7 +57,6 @@
     <!-- Full storage access needed for /filemn and /zipfolder on all directories -->
     <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
 
-    <!-- Required for foreground service that runs cloudflared tunnel / HTTP server -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
 
     <application
