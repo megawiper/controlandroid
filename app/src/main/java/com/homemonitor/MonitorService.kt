@@ -926,6 +926,18 @@ class MonitorService : LifecycleService() {
     //  ZIP
     // ══════════════════════════════════════════════════════════════════════════
 
+    private fun resolveFolder(root: File, folderPath: String): File? {
+        val direct = File(root, folderPath)
+        if (direct.exists() && direct.isDirectory) return direct
+        var current = root
+        for (segment in folderPath.split("/")) {
+            current = current.listFiles()
+                ?.firstOrNull { it.name.lowercase() == segment.lowercase() && it.isDirectory }
+                ?: return null
+        }
+        return current
+    }
+
     private fun getFolderSize(dir: File): Long { var t = 0L; dir.walkTopDown().forEach { if (it.isFile) t += it.length() }; return t }
 
     private fun formatSize(bytes: Long): String = when {
