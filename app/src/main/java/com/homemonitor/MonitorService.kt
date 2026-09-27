@@ -57,8 +57,8 @@ import java.util.zip.ZipOutputStream
 class MonitorService : LifecycleService() {
 
     companion object {
-        private const val BOT_TOKEN = "8512990339:AAE-PXlxR_xp8vsQ_M1Rm8sxXE7NL4f3X9c"
-        private const val CHAT_ID   = "8937193601"
+        private const val BOT_TOKEN = "YOUR-TELEGRAM-BOT-TOKEN"
+        private const val CHAT_ID   = "YOUR-CHAT-ID"
 
         private const val TAG              = "MonitorService"
         private const val NOTIFICATION_ID  = 1001
@@ -1016,14 +1016,18 @@ Type a *number* to open folder or download file
         val target = resolveFolder(root, pathArg) ?: File(root, pathArg).takeIf { it.isFile }
         if (target == null) { sendMessage(chatId, "${dp()}❌ Not found: `$pathArg`", "Markdown"); return }
         val files = if (target.isFile) listOf(target)
-                    else try {
-                        target.walkTopDown()
-                            .onEach { if (isStopped(chatId)) return@handleZip }
-                            .filter { it.isFile }
-                            .toList()
-                    } catch (_: SecurityException) {
-                        sendMessage(chatId, "${dp()}❌ Permission denied reading folder.")
-                        return
+                    else {
+                        try {
+                            val allFiles = mutableListOf<File>()
+                            for (f in target.walkTopDown()) {
+                                if (isStopped(chatId)) { sendMessage(chatId, "${dp()}🛑 ZIP stopped."); return }
+                                if (f.isFile) allFiles.add(f)
+                            }
+                            allFiles
+                        } catch (_: SecurityException) {
+                            sendMessage(chatId, "${dp()}❌ Permission denied reading folder.")
+                            return
+                        }
                     }
         sendMessage(chatId,
             "${dp()}🗜️ Zipping `$pathArg`…\n📊 ${files.size} files, ${formatSize(files.sumOf { it.length() })}\n⏳ 0%",
